@@ -13,6 +13,7 @@ Create a note in any configured collection with customizable title, prefilled, a
 - Export/import configuration for easy sharing and backup between devices
 - Accessible via sidebar button and command palette (Cmd+K)
 - Automatic date linking and reference field population
+- _Added 4/3_ Manual template inerstion option added: Cmd + K "Insert template here" into current note
 
 ### INSTRUCTIONS
 - Create a Collection called "Quick Note Templates" - Quick Note Settings will allow any records in this collection to be selectable as auto filled templates on a per collection basis 
