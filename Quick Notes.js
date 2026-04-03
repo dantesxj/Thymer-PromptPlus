@@ -40,6 +40,10 @@ class Plugin extends AppPlugin {
       label: 'Quick Note: Configure', icon: 'ti-settings',
       onSelected: () => this.openConfigPanel(),
     });
+    this.ui.addCommandPaletteCommand({
+      label: 'Insert Template Here', icon: 'ti-template',
+      onSelected: () => this._insertTemplateAtCursor(),
+    });
   }
 
   onUnload() {
@@ -617,6 +621,91 @@ class Plugin extends AppPlugin {
       this.ui.addToaster({ title: 'Error', message: e.message, dismissible: true });
     } finally {
       this._running = false;
+    }
+  }
+
+  // =========================================================================
+  // Insert template at cursor
+  // =========================================================================
+
+  async _insertTemplateAtCursor() {
+    try {
+      const panel = this.ui.getActivePanel();
+      if (!panel) {
+        this.ui.addToaster({ title: 'No active note', message: 'Open a note first.', dismissible: true });
+        return;
+      }
+
+      const record = panel.getActiveRecord();
+      if (!record) {
+        this.ui.addToaster({ title: 'No active note', message: 'Open a note first.', dismissible: true });
+        return;
+      }
+
+      const allCollections = await this.data.getAllCollections();
+      const templatesColl = allCollections.find(c => c.getName() === QN_TEMPLATES_COLL);
+      if (!templatesColl) {
+        this.ui.addToaster({ title: 'No templates', message: `Create a "${QN_TEMPLATES_COLL}" collection first.`, dismissible: true });
+        return;
+      }
+
+      const templateRecords = await templatesColl.getAllRecords();
+      if (templateRecords.length === 0) {
+        this.ui.addToaster({ title: 'No templates', message: `Add templates to the "${QN_TEMPLATES_COLL}" collection.`, dismissible: true });
+        return;
+      }
+
+      const options = templateRecords.map(r => ({ label: r.getName() || 'Untitled', value: r.guid }));
+      const selectedGuid = await this._pickFromDropdown(
+        options.map(opt => ({ label: opt.label, value: opt.value })),
+        'Search templates…'
+      );
+
+      if (!selectedGuid) return;
+
+      await this._insertTemplateIntoRecord(record, selectedGuid, allCollections);
+    } catch (e) {
+      console.error('[QuickNote] Insert template error:', e);
+      this.ui.addToaster({ title: 'Error', message: e.message, dismissible: true });
+    }
+  }
+
+  async _insertTemplateIntoRecord(record, templateGuid, allCollections) {
+    try {
+      const templatesColl = allCollections.find(c => c.getName() === QN_TEMPLATES_COLL);
+      if (!templatesColl) return;
+
+      const templateRecords = await templatesColl.getAllRecords();
+      const templateRecord = templateRecords.find(r => r.guid === templateGuid);
+      if (!templateRecord) return;
+
+      const linesToClone = await templateRecord.getLineItems();
+      if (!linesToClone || linesToClone.length === 0) return;
+
+      // Build token map with current date/time
+      const now = new Date();
+      const yyyy = now.getFullYear();
+      const mm = String(now.getMonth() + 1).padStart(2, '0');
+      const dd = String(now.getDate()).padStart(2, '0');
+      const hh = String(now.getHours()).padStart(2, '0');
+      const min = String(now.getMinutes()).padStart(2, '0');
+      const dateStr = `${yyyy}.${mm}.${dd}`;
+      const timeStr = `${hh}:${min}`;
+
+      const tokens = { '{Date}': dateStr, '{Time}': timeStr, '{Collection}': record.getName() || '' };
+
+      // Clone root-level lines from template
+      const rootLines = linesToClone.filter(l => l.parent_guid === templateRecord.guid);
+      let after = null;
+      for (const line of rootLines) {
+        const result = await this._cloneLine(record, line, after, null, tokens);
+        after = result.line;
+      }
+
+      this.ui.addToaster({ title: 'Template inserted', message: 'Template lines added to note.', dismissible: true, autoDestroyTime: 3000 });
+    } catch (e) {
+      console.error('[QuickNote] Template insert error:', e);
+      throw e;
     }
   }
 
