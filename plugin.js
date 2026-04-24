@@ -1214,18 +1214,9 @@ class Plugin extends AppPlugin {
   _promptReferenceMulti(fieldName, records) {
     return new Promise((resolve) => {
       const panel = this.ui.getActivePanel();
-      let left = Math.round(window.innerWidth / 2) - 190;
-      let top  = Math.round(window.innerHeight / 5);
-      if (panel) {
-        const el = panel.getElement();
-        if (el) {
-          const r = el.getBoundingClientRect();
-          left = Math.round(r.left + r.width / 2) - 190;
-          top  = Math.round(r.top + 60);
-        }
-      }
+      const { left, top, width } = this._qnPromptShellPosition(panel, 380, 12);
       const box = document.createElement('div');
-      box.style.cssText = this._qnFrostedPromptShellStyle(Math.max(12, left), Math.max(12, top), 380)
+      box.style.cssText = this._qnFrostedPromptShellStyle(left, top, width)
         + 'max-height:min(420px,calc(100vh - 24px));padding:14px;box-sizing:border-box;';
       const lbl = document.createElement('div');
       lbl.textContent = fieldName + ' (select any, then OK)';
@@ -1321,9 +1312,9 @@ class Plugin extends AppPlugin {
   _pickFromDropdown(options, placeholder) {
     return new Promise((resolve) => {
       const panel = this.ui.getActivePanel();
-      const { left, top } = this._qnPromptShellPosition(panel);
+      const { left, top, width } = this._qnPromptShellPosition(panel, 360, 12);
       const box = document.createElement('div');
-      box.style.cssText = this._qnFrostedPromptShellStyle(Math.max(12, left), Math.max(12, top), 360)
+      box.style.cssText = this._qnFrostedPromptShellStyle(left, top, width)
         + 'max-height:min(460px,calc(100vh - 24px));padding:14px;box-sizing:border-box;';
 
       const search = document.createElement('input');
@@ -1504,18 +1495,22 @@ class Plugin extends AppPlugin {
     }
   }
 
-  _qnPromptShellPosition(panel) {
-    let left = Math.round(window.innerWidth / 2) - 175;
+  _qnPromptShellPosition(panel, preferredWidth = 350, margin = 12) {
+    const maxAllowedWidth = Math.max(240, window.innerWidth - (margin * 2));
+    const width = Math.min(preferredWidth, maxAllowedWidth);
+    let left = Math.round(window.innerWidth / 2) - Math.round(width / 2);
     let top  = Math.round(window.innerHeight / 3);
     if (panel) {
       const el = panel.getElement();
       if (el) {
         const r = el.getBoundingClientRect();
-        left = Math.round(r.left + r.width / 2) - 175;
+        left = Math.round(r.left + r.width / 2) - Math.round(width / 2);
         top  = Math.round(r.top + 80);
       }
     }
-    return { left, top };
+    const clampedLeft = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
+    const clampedTop = Math.max(margin, Math.min(top, window.innerHeight - 140));
+    return { left: clampedLeft, top: clampedTop, width };
   }
 
   _qnThemeRgb(varName, fallbackHex) {
@@ -1534,7 +1529,7 @@ class Plugin extends AppPlugin {
       + `backdrop-filter:blur(16px) saturate(1.28);-webkit-backdrop-filter:blur(16px) saturate(1.28);`
       + `border:1px solid rgba(255,255,255,0.14);border-radius:12px;`
       + `box-shadow:var(--cmdpal-box-shadow,0 12px 40px rgba(0,0,0,0.45));`
-      + `padding:16px;z-index:99999;display:flex;flex-direction:column;gap:10px;`;
+      + `padding:16px;z-index:99999;display:flex;flex-direction:column;gap:10px;max-width:calc(100vw - 24px);`;
   }
 
   _promptDate(fieldName, fieldConf, fieldMeta, conf) {
@@ -1543,9 +1538,9 @@ class Plugin extends AppPlugin {
       let includeTime = initialInclude;
 
       const panel = this.ui.getActivePanel();
-      const { left, top } = this._qnPromptShellPosition(panel);
+      const { left, top, width } = this._qnPromptShellPosition(panel, 350, 12);
       const box = document.createElement('div');
-      box.style.cssText = this._qnFrostedPromptShellStyle(left, top);
+      box.style.cssText = this._qnFrostedPromptShellStyle(left, top, width);
       const lbl = document.createElement('div');
       lbl.textContent = fieldName;
       lbl.style.cssText = 'font-weight:600;font-size:14px;';
@@ -1651,9 +1646,9 @@ class Plugin extends AppPlugin {
   _promptText(fieldName) {
     return new Promise((resolve) => {
       const panel = this.ui.getActivePanel();
-      const { left, top } = this._qnPromptShellPosition(panel);
+      const { left, top, width } = this._qnPromptShellPosition(panel, 350, 12);
       const box = document.createElement('div');
-      box.style.cssText = this._qnFrostedPromptShellStyle(left, top);
+      box.style.cssText = this._qnFrostedPromptShellStyle(left, top, width);
       const lbl=document.createElement('div'); lbl.textContent=fieldName; lbl.style.cssText='font-weight:600;font-size:14px;';
       const inp=document.createElement('input'); inp.type='text'; inp.placeholder=`Enter ${fieldName}…`;
       inp.style.cssText='width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--border-default,#3f3f46);background:var(--input-bg-color,#181511);color:inherit;font-size:14px;box-sizing:border-box;outline:none;';
