@@ -499,6 +499,7 @@
     const coll = await findColl(data);
     if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') return;
     await upgradePluginSettingsSchema(data, coll);
+    let slugRegisterSavedOk = false;
     try {
       const base = coll.getConfiguration() || {};
       const fields = Array.isArray(base.fields) ? [...base.fields] : [];
@@ -546,11 +547,12 @@
         fields[idx] = next;
         const ok = await coll.saveConfiguration(withUnlockedManaged({ ...base, fields }));
         if (ok === false) console.warn('[ThymerPluginSettings] registerPluginSlug: saveConfiguration returned false');
+        else slugRegisterSavedOk = true;
       }
     } catch (e) {
       console.error('[ThymerPluginSettings] registerPluginSlug', e);
     }
-    await rewritePluginChoiceCells(coll);
+    if (slugRegisterSavedOk) await rewritePluginChoiceCells(coll);
   }
 
   /**
@@ -627,7 +629,7 @@
           } catch (_) {}
         }
       }
-      await rewritePluginChoiceCells(coll);
+      if (changed) await rewritePluginChoiceCells(coll);
     } catch (e) {
       console.error('[ThymerPluginSettings] upgrade schema', e);
     }
@@ -1072,10 +1074,10 @@
     return named || cands[0];
   }
 
-  async function findColl(data) {
+  function pickCollFromAll(all) {
     try {
-      const pick = (all) => {
-        const list = Array.isArray(all) ? all : [];
+      const pick = (allIn) => {
+        const list = Array.isArray(allIn) ? allIn : [];
         return (
           list.find((c) => collectionDisplayName(c) === COL_NAME) ||
           list.find((c) => collectionDisplayName(c) === COL_NAME_LEGACY) ||
@@ -1084,8 +1086,27 @@
           null
         );
       };
-      const all = await data.getAllCollections();
       return pick(all) || pickPathBCollectionHeuristic(all) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function hasPluginBackendInAll(all) {
+    if (!Array.isArray(all) || all.length === 0) return false;
+    for (const c of all) {
+      const nm = collectionDisplayName(c);
+      if (nm === COL_NAME || nm === COL_NAME_LEGACY) return true;
+      const cfg = collectionBackendConfiguredTitle(c);
+      if (cfg === COL_NAME || cfg === COL_NAME_LEGACY) return true;
+    }
+    return !!pickPathBCollectionHeuristic(all);
+  }
+
+  async function findColl(data) {
+    try {
+      const all = await data.getAllCollections();
+      return pickCollFromAll(all);
     } catch (_) {
       return null;
     }
@@ -1099,14 +1120,7 @@
     } catch (_) {
       return false;
     }
-    if (!Array.isArray(all) || all.length === 0) return false;
-    for (const c of all) {
-      const nm = collectionDisplayName(c);
-      if (nm === COL_NAME || nm === COL_NAME_LEGACY) return true;
-      const cfg = collectionBackendConfiguredTitle(c);
-      if (cfg === COL_NAME || cfg === COL_NAME_LEGACY) return true;
-    }
-    return !!pickPathBCollectionHeuristic(all);
+    return hasPluginBackendInAll(all);
   }
 
   const PB_LOCK_NAME = 'thymer-ext-plugin-backend-ensure-v1';
@@ -1203,17 +1217,52 @@
     try {
       let existing = null;
       for (let attempt = 0; attempt < 4; attempt++) {
+        let allAttempt;
+        try {
+          allAttempt = await data.getAllCollections();
+        } catch (_) {
+          allAttempt = null;
+        }
+        if (allAttempt != null) {
+          existing = pickCollFromAll(allAttempt);
+          if (existing) return;
+          if (hasPluginBackendInAll(allAttempt)) return;
+        } else {
+          existing = await findColl(data);
+          if (existing) return;
+          if (await hasPluginBackendOnWorkspace(data)) return;
+        }
+        if (attempt < 3) await new Promise((r) => setTimeout(r, 50 + attempt * 50));
+      }
+      let allPost;
+      try {
+        allPost = await data.getAllCollections();
+      } catch (_) {
+        allPost = null;
+      }
+      if (allPost != null) {
+        existing = pickCollFromAll(allPost);
+        if (existing) return;
+        if (hasPluginBackendInAll(allPost)) return;
+      } else {
         existing = await findColl(data);
         if (existing) return;
         if (await hasPluginBackendOnWorkspace(data)) return;
-        if (attempt < 3) await new Promise((r) => setTimeout(r, 50 + attempt * 50));
       }
-      existing = await findColl(data);
-      if (existing) return;
-      if (await hasPluginBackendOnWorkspace(data)) return;
       await new Promise((r) => setTimeout(r, 120));
-      if (await findColl(data)) return;
-      if (await hasPluginBackendOnWorkspace(data)) return;
+      let allAfterWait;
+      try {
+        allAfterWait = await data.getAllCollections();
+      } catch (_) {
+        allAfterWait = null;
+      }
+      if (allAfterWait != null) {
+        if (pickCollFromAll(allAfterWait)) return;
+        if (hasPluginBackendInAll(allAfterWait)) return;
+      } else {
+        if (await findColl(data)) return;
+        if (await hasPluginBackendOnWorkspace(data)) return;
+      }
       let preCreateLen = 0;
       try {
         if (data && data.getAllCollections) {
@@ -1230,8 +1279,19 @@
           }
         }
         if (preCreateLen > 0) {
-          if (await findColl(data)) return;
-          if (await hasPluginBackendOnWorkspace(data)) return;
+          let allPre;
+          try {
+            allPre = await data.getAllCollections();
+          } catch (_) {
+            allPre = null;
+          }
+          if (allPre != null) {
+            if (pickCollFromAll(allPre)) return;
+            if (hasPluginBackendInAll(allPre)) return;
+          } else {
+            if (await findColl(data)) return;
+            if (await hasPluginBackendOnWorkspace(data)) return;
+          }
         }
         if (isSuspiciousEmptyAfterRecentNonEmptyList(preCreateLen) && preCreateLen === 0) {
           if (DEBUG_COLLECTIONS) {
@@ -1251,15 +1311,37 @@
       const lease = await acquirePluginBackendCreationLease(14000, data);
       if (lease.denied) return;
       try {
-        if (await findColl(data)) return;
-        if (await hasPluginBackendOnWorkspace(data)) return;
+        let allLease;
+        try {
+          allLease = await data.getAllCollections();
+        } catch (_) {
+          allLease = null;
+        }
+        if (allLease != null) {
+          if (pickCollFromAll(allLease)) return;
+          if (hasPluginBackendInAll(allLease)) return;
+        } else {
+          if (await findColl(data)) return;
+          if (await hasPluginBackendOnWorkspace(data)) return;
+        }
         const recentAttemptAge = getRecentPluginBackendCreateAttemptAgeMs(data);
         if (recentAttemptAge != null && recentAttemptAge >= 0 && recentAttemptAge < 120000) {
           // Another plugin iframe attempted creation very recently. Avoid burst duplicate creates.
           for (let i = 0; i < 10; i++) {
             await new Promise((r) => setTimeout(r, 130 + i * 70));
-            if (await findColl(data)) return;
-            if (await hasPluginBackendOnWorkspace(data)) return;
+            let allCont;
+            try {
+              allCont = await data.getAllCollections();
+            } catch (_) {
+              allCont = null;
+            }
+            if (allCont != null) {
+              if (pickCollFromAll(allCont)) return;
+              if (hasPluginBackendInAll(allCont)) return;
+            } else {
+              if (await findColl(data)) return;
+              if (await hasPluginBackendOnWorkspace(data)) return;
+            }
           }
           return;
         }
@@ -1268,8 +1350,19 @@
           // Another plugin/runtime likely just created it; let collection list/indexing settle first.
           for (let i = 0; i < 8; i++) {
             await new Promise((r) => setTimeout(r, 120 + i * 60));
-            if (await findColl(data)) return;
-            if (await hasPluginBackendOnWorkspace(data)) return;
+            let allSettle;
+            try {
+              allSettle = await data.getAllCollections();
+            } catch (_) {
+              allSettle = null;
+            }
+            if (allSettle != null) {
+              if (pickCollFromAll(allSettle)) return;
+              if (hasPluginBackendInAll(allSettle)) return;
+            } else {
+              if (await findColl(data)) return;
+              if (await hasPluginBackendOnWorkspace(data)) return;
+            }
           }
         }
         noteRecentPluginBackendCreateAttempt(data);
@@ -1965,6 +2058,29 @@ const QN_EXP_COMMANDS_ONLY = true;
 
 class Plugin extends AppPlugin {
 
+  /** Workspace-scoped cache for `getAllCollections` (invalidated after templates ensure). */
+  _qnCollListKey = null;
+  _qnCollListCached = null;
+  /** Per-`run()` cache: source collection name → records for reference prompts (same run only). */
+  _qnPromptSessionRefCache = null;
+
+  _invalidateQnCollListCache() {
+    this._qnCollListKey = null;
+    this._qnCollListCached = null;
+  }
+
+  async _getAllCollectionsCached() {
+    let key = '';
+    try {
+      key = String(this.data.getActiveUsers?.()?.[0]?.workspaceGuid || '');
+    } catch (_) {}
+    if (this._qnCollListKey === key && Array.isArray(this._qnCollListCached)) return this._qnCollListCached;
+    const all = await this.data.getAllCollections();
+    this._qnCollListKey = key;
+    this._qnCollListCached = all;
+    return all;
+  }
+
   async onLoad() {
     await (globalThis.ThymerPluginSettings?.init?.({
       plugin: this,
@@ -1995,14 +2111,17 @@ class Plugin extends AppPlugin {
         icon: QN_PLUGIN_ICON, label: QN_PLUGIN_NAME, tooltip: 'Create a timestamped note',
         onClick: () => this.run(),
       });
-      this._qnStatusItem = this.ui.addStatusBarItem?.({
-        icon: QN_PLUGIN_ICON,
-        tooltip: `${QN_PLUGIN_NAME} — create a timestamped note`,
-        onClick: () => this.run(),
-      }) ?? null;
-    } else {
-      this._qnStatusItem = null;
     }
+    this._qnStatusItem = this.ui.addStatusBarItem?.({
+      icon: 'ti-plus',
+      tooltip: `${QN_PLUGIN_NAME} — create a timestamped note`,
+      onClick: () => this.run(),
+    }) ?? null;
+    this.ui.addCommandPaletteCommand({
+      label: 'quick prompt+',
+      icon: 'ti-plus',
+      onSelected: () => this.run(),
+    });
     this.ui.addCommandPaletteCommand({
       label: QN_PLUGIN_NAME, icon: QN_PLUGIN_ICON, onSelected: () => this.run(),
     });
@@ -2032,6 +2151,8 @@ class Plugin extends AppPlugin {
   }
 
   onUnload() {
+    this._invalidateQnCollListCache();
+    this._qnPromptSessionRefCache = null;
     for (const id of (this._eventHandlerIds || [])) {
       try { this.events.off(id); } catch (_) {}
     }
@@ -2084,8 +2205,9 @@ class Plugin extends AppPlugin {
     } catch (_) {
       void 0;
     }
+    this._invalidateQnCollListCache();
 
-    const allCollections  = await this.data.getAllCollections();
+    const allCollections  = await this._getAllCollectionsCached();
     const skip            = qnTemplatesSkipNamesLower();
     const candidates      = allCollections.filter(c => !skip.has((c.getName() || '').toLowerCase()));
     const templatesColl   = findQnTemplatesCollectionInList(allCollections);
@@ -2539,13 +2661,15 @@ class Plugin extends AppPlugin {
     // Guard against double-trigger from rapid sidebar clicks
     if (this._running) return;
     this._running = true;
+    this._qnPromptSessionRefCache = new Map();
     try {
       try {
         await ensureQnTemplatesCollection(this.data);
       } catch (_) {
         void 0;
       }
-      const allCollections = await this.data.getAllCollections();
+      this._invalidateQnCollListCache();
+      const allCollections = await this._getAllCollectionsCached();
       const eligible       = this._getEnabledCollections(allCollections);
 
       if (eligible.length === 0) {
@@ -2606,9 +2730,16 @@ class Plugin extends AppPlugin {
       const newGuid = chosen.createRecord(title);
       if (!newGuid) { this.ui.addToaster({ title: 'Error', message: 'Failed to create record.', dismissible: true }); return; }
 
-      await this._sleep(200);
-      const allRecords = await chosen.getAllRecords();
-      const record     = allRecords.find(r => r.guid === newGuid);
+      let record = null;
+      for (let i = 0; i < 25; i++) {
+        try {
+          record = this.data.getRecord(newGuid);
+        } catch (_) {
+          record = null;
+        }
+        if (record) break;
+        await this._sleep(i < 10 ? 60 : 100);
+      }
 
       if (record) {
         // Auto-fill date field (skip if user prompts for that field — calendar sets it later)
@@ -2678,6 +2809,7 @@ class Plugin extends AppPlugin {
       console.error(`[${QN_PLUGIN_NAME}]`, e);
       this.ui.addToaster({ title: 'Error', message: e.message, dismissible: true });
     } finally {
+      this._qnPromptSessionRefCache = null;
       this._running = false;
     }
   }
@@ -2705,7 +2837,8 @@ class Plugin extends AppPlugin {
       } catch (_) {
         void 0;
       }
-      const allCollections = await this.data.getAllCollections();
+      this._invalidateQnCollListCache();
+      const allCollections = await this._getAllCollectionsCached();
       const templatesColl = findQnTemplatesCollectionInList(allCollections);
       if (!templatesColl) {
         this.ui.addToaster({ title: 'No templates', message: `The templates collection ( "${QN_TEMPLATES_COLL}" or "${QN_TEMPLATES_COLL_LEGACY}" ) was not found. Try reloading.`, dismissible: true });
@@ -2736,11 +2869,22 @@ class Plugin extends AppPlugin {
 
   async _insertTemplateIntoRecord(record, templateGuid, allCollections) {
     try {
-      const templatesColl = findQnTemplatesCollectionInList(allCollections);
-      if (!templatesColl) return;
-
-      const templateRecords = await templatesColl.getAllRecords();
-      const templateRecord = templateRecords.find(r => r.guid === templateGuid);
+      let templateRecord = null;
+      for (let i = 0; i < 20; i++) {
+        try {
+          templateRecord = this.data.getRecord(templateGuid);
+        } catch (_) {
+          templateRecord = null;
+        }
+        if (templateRecord) break;
+        await this._sleep(80);
+      }
+      if (!templateRecord) {
+        const templatesColl = findQnTemplatesCollectionInList(allCollections);
+        if (!templatesColl) return;
+        const templateRecords = await templatesColl.getAllRecords();
+        templateRecord = templateRecords.find(r => r.guid === templateGuid);
+      }
       if (!templateRecord) return;
 
       const linesToClone = await templateRecord.getLineItems();
@@ -2779,10 +2923,22 @@ class Plugin extends AppPlugin {
 
   async _applyTemplate(templateGuid, recordGuid, tokens, allCollections) {
     try {
-      const templatesColl   = findQnTemplatesCollectionInList(allCollections);
+      const templatesColl = findQnTemplatesCollectionInList(allCollections);
       if (!templatesColl) return;
-      const templateRecords = await templatesColl.getAllRecords();
-      const templateRecord  = templateRecords.find(r => r.guid === templateGuid);
+      let templateRecord = null;
+      for (let i = 0; i < 20; i++) {
+        try {
+          templateRecord = this.data.getRecord(templateGuid);
+        } catch (_) {
+          templateRecord = null;
+        }
+        if (templateRecord) break;
+        await this._sleep(100);
+      }
+      if (!templateRecord) {
+        const templateRecords = await templatesColl.getAllRecords();
+        templateRecord = templateRecords.find(r => r.guid === templateGuid);
+      }
       if (!templateRecord) return;
 
       const linesToClone = await templateRecord.getLineItems();
@@ -3112,8 +3268,15 @@ class Plugin extends AppPlugin {
     }
     const type = fieldConf.type || 'text';
     if (type === 'reference') {
-      const sourceColl = allCollections.find(c => c.getName() === (fieldConf.sourceCollection || 'People'));
-      const records    = sourceColl ? await sourceColl.getAllRecords() : [];
+      const srcName = fieldConf.sourceCollection || 'People';
+      const sourceColl = allCollections.find(c => c.getName() === srcName);
+      let records;
+      if (this._qnPromptSessionRefCache && this._qnPromptSessionRefCache.has(srcName)) {
+        records = this._qnPromptSessionRefCache.get(srcName);
+      } else {
+        records = sourceColl ? await sourceColl.getAllRecords() : [];
+        if (this._qnPromptSessionRefCache) this._qnPromptSessionRefCache.set(srcName, records);
+      }
       if (fieldConf.referenceMultiple === true) {
         return this._promptReferenceMulti(fieldName, records);
       }
