@@ -6,7 +6,7 @@
 
 
 
-// @generated BEGIN thymer-plugin-settings (source: plugins/plugin-settings/ThymerPluginSettingsRuntime.js — run: npm run embed-plugin-settings)
+// @generated BEGIN thymer-plugin-settings (source: plugins/public repo/plugin-settings/ThymerPluginSettingsRuntime.js — run: npm run embed-plugin-settings)
 /**
  * ThymerPluginSettings — workspace **Plugin Backend** collection + optional localStorage mirror
  * for global plugins that do not own a collection. (Legacy name **Plugin Settings** is still found until renamed.)
@@ -618,7 +618,7 @@
               console.error(
                 '[ThymerPluginSettings] saveConfiguration succeeded but "plugin" field is still type',
                 pf.type,
-                '— check collection General tab or re-import plugins/plugin-settings/Plugin Backend.json.'
+                '— check collection General tab or re-import plugins/public repo/plugin-settings/Plugin Backend.json.'
               );
             }
           } catch (_) {}
@@ -1904,6 +1904,10 @@ function ensureQnTemplatesCollection(data) {
 }
 const QN_PLUGIN_ICON = 'ti-message-plus';
 const QN_PLUGIN_NAME = 'Prompt+';
+// Experiment toggle: isolate reload lag by skipping startup template ensure.
+const QN_EXP_SKIP_STARTUP_TEMPLATE_ENSURE = true;
+// Experiment toggle: commands only (skip sidebar/statusbar item registration).
+const QN_EXP_COMMANDS_ONLY = true;
 
 class Plugin extends AppPlugin {
 
@@ -1917,10 +1921,12 @@ class Plugin extends AppPlugin {
       data: this.data,
       ui: this.ui,
     }) ?? (console.warn(`[${QN_PLUGIN_NAME}] ThymerPluginSettings runtime missing (redeploy full plugin .js from repo).`), Promise.resolve()));
-    try {
-      await ensureQnTemplatesCollection(this.data);
-    } catch (e) {
-      console.warn(`[${QN_PLUGIN_NAME}] ensure templates collection`, e);
+    if (!QN_EXP_SKIP_STARTUP_TEMPLATE_ENSURE) {
+      try {
+        await ensureQnTemplatesCollection(this.data);
+      } catch (e) {
+        console.warn(`[${QN_PLUGIN_NAME}] ensure templates collection`, e);
+      }
     }
     this._eventHandlerIds = [];
     this._running         = false; // guard against double-trigger
@@ -1930,15 +1936,19 @@ class Plugin extends AppPlugin {
       this._mountConfigPanel(panel);
     });
 
-    this.ui.addSidebarItem({
-      icon: QN_PLUGIN_ICON, label: QN_PLUGIN_NAME, tooltip: 'Create a timestamped note',
-      onClick: () => this.run(),
-    });
-    this._qnStatusItem = this.ui.addStatusBarItem?.({
-      icon: QN_PLUGIN_ICON,
-      tooltip: `${QN_PLUGIN_NAME} — create a timestamped note`,
-      onClick: () => this.run(),
-    }) ?? null;
+    if (!QN_EXP_COMMANDS_ONLY) {
+      this.ui.addSidebarItem({
+        icon: QN_PLUGIN_ICON, label: QN_PLUGIN_NAME, tooltip: 'Create a timestamped note',
+        onClick: () => this.run(),
+      });
+      this._qnStatusItem = this.ui.addStatusBarItem?.({
+        icon: QN_PLUGIN_ICON,
+        tooltip: `${QN_PLUGIN_NAME} — create a timestamped note`,
+        onClick: () => this.run(),
+      }) ?? null;
+    } else {
+      this._qnStatusItem = null;
+    }
     this.ui.addCommandPaletteCommand({
       label: QN_PLUGIN_NAME, icon: QN_PLUGIN_ICON, onSelected: () => this.run(),
     });
