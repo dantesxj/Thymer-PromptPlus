@@ -780,12 +780,66 @@
     return false;
   }
 
+  /** Parse ISO-ish timestamps for vault row scoring (duplicates: pick freshest, not first in list). */
+  function parseVaultIsoMs(s) {
+    const n = Date.parse(String(s || ''));
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function vaultRowFreshnessScore(r) {
+    let score = 0;
+    let raw = '';
+    try {
+      raw = rowField(r, 'settings_json');
+    } catch (_) {}
+    if (raw && String(raw).trim()) {
+      try {
+        const j = JSON.parse(raw);
+        if (j && typeof j.updatedAt === 'string') {
+          const ms = parseVaultIsoMs(j.updatedAt);
+          if (ms > score) score = ms;
+        }
+      } catch (_) {}
+    }
+    try {
+      const ua = rowField(r, 'updated_at');
+      if (ua) {
+        const ms = parseVaultIsoMs(ua);
+        if (ms > score) score = ms;
+      }
+    } catch (_) {}
+    return score;
+  }
+
+  function settingsJsonPayloadLen(r) {
+    try {
+      return String(rowField(r, 'settings_json') || '').length;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /**
+   * Prefer the **newest** vault row when duplicates exist (same `plugin_id`, multiple vault-shaped rows).
+   * Previously the first list match could be stale while a newer row held the real payload.
+   */
   function findVaultRecord(records, pluginId) {
     if (!records) return null;
+    let best = null;
+    let bestScore = -1;
     for (const x of records) {
-      if (isVaultRow(x, pluginId)) return x;
+      if (!isVaultRow(x, pluginId)) continue;
+      const sc = vaultRowFreshnessScore(x);
+      if (sc > bestScore) {
+        bestScore = sc;
+        best = x;
+      } else if (sc === bestScore && best) {
+        const lenX = settingsJsonPayloadLen(x);
+        const lenB = settingsJsonPayloadLen(best);
+        if (lenX > lenB) best = x;
+      }
     }
-    return null;
+    return best;
   }
 
   function applyVaultRowMeta(r, pluginId, coll) {
@@ -2464,6 +2518,9 @@ class Plugin extends AppPlugin {
   }
 
   _saveConfig() {
+    try {
+      this._config.savedAt = new Date().toISOString();
+    } catch (_) {}
     try { localStorage.setItem(QN_STORAGE_KEY, JSON.stringify(this._config)); } catch (_) {}
     globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => [QN_STORAGE_KEY]);
   }
@@ -3315,7 +3372,53 @@ class Plugin extends AppPlugin {
     } catch (_) {}
   }
 
-  _promptReferenceMulti(fieldName, records) {
+  _qnCollectionSingular(coll, fallbackName) {
+    const fb = fallbackName || 'Record';
+    if (!coll) return fb.replace(/s$/i, '');
+    try {
+      const cfg = coll.getConfiguration?.() || {};
+      return cfg.item_name || cfg.itemName || cfg.custom?.item_name
+        || (coll.getName?.() || fb).replace(/s$/i, '');
+    } catch (_) {
+      return fb.replace(/s$/i, '');
+    }
+  }
+
+  _qnReferenceHasExactMatch(records, query) {
+    const q = (query || '').trim().toLowerCase();
+    if (!q) return false;
+    return records.some((r) => ((r.getName?.() || '') + '').trim().toLowerCase() === q);
+  }
+
+  async _qnCreateRecordInCollection(sourceColl, title, cacheKeyName) {
+    const name = (title || '').trim();
+    if (!sourceColl || !name) return null;
+    let newGuid;
+    try {
+      newGuid = sourceColl.createRecord?.(name);
+    } catch (_) {
+      return null;
+    }
+    if (!newGuid) return null;
+    let record = null;
+    for (let i = 0; i < 25; i++) {
+      try {
+        record = this.data.getRecord(newGuid);
+      } catch (_) {
+        record = null;
+      }
+      if (record) break;
+      await this._sleep(i < 10 ? 60 : 100);
+    }
+    if (cacheKeyName && this._qnPromptSessionRefCache) {
+      const cached = this._qnPromptSessionRefCache.get(cacheKeyName);
+      if (Array.isArray(cached) && record) cached.push(record);
+    }
+    return { guid: newGuid, record, name };
+  }
+
+  _promptReferenceMulti(fieldName, records, sourceColl, srcName) {
+    const singular = this._qnCollectionSingular(sourceColl, srcName);
     return new Promise((resolve) => {
       const panel = this.ui.getActivePanel();
       const { left, top, width } = this._qnPromptShellPosition(panel, 380, 12);
@@ -3332,10 +3435,39 @@ class Plugin extends AppPlugin {
       const listWrap = document.createElement('div');
       listWrap.style.cssText = 'flex:1;min-height:120px;max-height:260px;overflow:auto;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:4px 2px;background:rgba(6,6,10,0.24);';
       const selected = new Map();
+      let creating = false;
       const sorted = () => [...records].sort((a, b) => (a.getName() || '').localeCompare(b.getName() || '', undefined, { sensitivity: 'base' }));
       const renderList = () => {
         listWrap.innerHTML = '';
-        const q = (search.value || '').trim().toLowerCase();
+        const qRaw = (search.value || '').trim();
+        const q = qRaw.toLowerCase();
+        const showCreate = !!qRaw && sourceColl && !this._qnReferenceHasExactMatch(records, qRaw);
+        if (showCreate) {
+          const createBtn = document.createElement('button');
+          createBtn.type = 'button';
+          createBtn.textContent = `Create new ${singular}`;
+          createBtn.style.cssText = 'display:block;width:calc(100% - 8px);margin:4px 4px 6px;text-align:left;padding:8px 10px;border:1px dashed rgba(167,139,250,0.45);background:rgba(167,139,250,0.12);color:var(--color-primary-300,#ddd6fe);border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;';
+          createBtn.addEventListener('click', async () => {
+            if (creating) return;
+            creating = true;
+            createBtn.disabled = true;
+            const created = await this._qnCreateRecordInCollection(sourceColl, qRaw, srcName);
+            creating = false;
+            createBtn.disabled = false;
+            if (created?.guid) {
+              selected.set(created.guid, created.name);
+              search.value = '';
+              renderList();
+            } else {
+              this.ui.addToaster?.({
+                title: 'Could not create record',
+                message: `Failed to create a new ${singular} in “${srcName}”.`,
+                dismissible: true,
+              });
+            }
+          });
+          listWrap.appendChild(createBtn);
+        }
         for (const r of sorted()) {
           const name = r.getName() || 'Untitled';
           if (q && !name.toLowerCase().includes(q)) continue;
@@ -3409,6 +3541,177 @@ class Plugin extends AppPlugin {
         }
       };
       document.addEventListener('pointerdown', onOut, true);
+      requestAnimationFrame(() => search.focus());
+    });
+  }
+
+  _promptReferenceSingle(fieldName, records, sourceColl, srcName) {
+    const singular = this._qnCollectionSingular(sourceColl, srcName);
+    const options = records.map((r) => ({
+      label: r.getName() || 'Untitled',
+      value: { displayValue: r.getName() || 'Untitled', guid: r.guid },
+    }));
+    options.push({ label: '— Skip —', value: { displayValue: '', guid: undefined } });
+
+    return new Promise((resolve) => {
+      const panel = this.ui.getActivePanel();
+      const { left, top, width } = this._qnPromptShellPosition(panel, 360, 12);
+      const box = document.createElement('div');
+      box.style.cssText = this._qnFrostedPromptShellStyle(left, top, width)
+        + 'max-height:min(460px,calc(100vh - 24px));padding:14px;box-sizing:border-box;';
+
+      const lbl = document.createElement('div');
+      lbl.textContent = fieldName;
+      lbl.style.cssText = 'font-weight:600;font-size:14px;flex-shrink:0;';
+
+      const search = document.createElement('input');
+      search.type = 'text';
+      search.placeholder = `Search ${fieldName}…`;
+      search.style.cssText = 'width:100%;padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.16);background:rgba(8,8,12,0.34);color:inherit;font-size:13px;box-sizing:border-box;outline:none;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);';
+
+      const listWrap = document.createElement('div');
+      listWrap.style.cssText = 'flex:1;min-height:140px;max-height:280px;overflow:auto;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:4px 2px;background:rgba(6,6,10,0.24);';
+
+      const btnRow = document.createElement('div');
+      btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;flex-shrink:0;';
+      const cancelBtn = document.createElement('button');
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.style.cssText = this._btnStyle('secondary');
+      btnRow.appendChild(cancelBtn);
+
+      box.appendChild(lbl);
+      box.appendChild(search);
+      box.appendChild(listWrap);
+      box.appendChild(btnRow);
+      document.body.appendChild(box);
+
+      let resolved = false;
+      let filtered = options.slice();
+      let activeIndex = 0;
+      let creating = false;
+
+      const done = (val) => {
+        if (resolved) return;
+        resolved = true;
+        document.removeEventListener('pointerdown', onOut, true);
+        box.remove();
+        resolve(val);
+      };
+
+      const renderList = () => {
+        listWrap.innerHTML = '';
+        const q = (search.value || '').trim();
+        const qLower = q.toLowerCase();
+        filtered = options.filter((opt) => !qLower || (opt.label || '').toLowerCase().includes(qLower));
+        const rows = [];
+        const showCreate = !!q && sourceColl && !this._qnReferenceHasExactMatch(records, q);
+        if (showCreate) {
+          rows.push({
+            kind: 'create',
+            label: `Create new ${singular}`,
+            sub: q,
+          });
+        }
+        for (const opt of filtered) rows.push({ kind: 'pick', opt });
+
+        if (activeIndex >= rows.length) activeIndex = Math.max(0, rows.length - 1);
+
+        rows.forEach((row, idx) => {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.style.cssText = 'display:block;width:100%;text-align:left;padding:7px 10px;border:0;background:transparent;color:inherit;border-radius:6px;cursor:pointer;font-size:13px;';
+          if (idx === activeIndex) btn.style.background = 'rgba(255,255,255,0.12)';
+          if (row.kind === 'create') {
+            btn.innerHTML = `<span style="font-weight:600;color:var(--color-primary-400,#c4b5fd);">${row.label}</span>`
+              + `<span style="display:block;font-size:12px;color:var(--text-muted,#a1a1aa);margin-top:2px;">“${row.sub}”</span>`;
+            btn.addEventListener('click', async () => {
+              if (creating) return;
+              creating = true;
+              btn.disabled = true;
+              const created = await this._qnCreateRecordInCollection(sourceColl, q, srcName);
+              creating = false;
+              if (created?.guid) {
+                done({ displayValue: created.name, guid: created.guid });
+              } else {
+                btn.disabled = false;
+                this.ui.addToaster?.({
+                  title: 'Could not create record',
+                  message: `Failed to create a new ${singular} in “${srcName}”.`,
+                  dismissible: true,
+                });
+              }
+            });
+          } else {
+            btn.textContent = row.opt.label;
+            btn.addEventListener('click', () => done(row.opt.value));
+          }
+          btn.addEventListener('mouseenter', () => {
+            activeIndex = idx;
+            renderList();
+          });
+          listWrap.appendChild(btn);
+        });
+
+        if (!rows.length) {
+          const empty = document.createElement('div');
+          empty.textContent = records.length ? 'No matches.' : 'No records in source collection.';
+          empty.style.cssText = 'padding:12px;color:var(--text-muted,#888);font-size:13px;text-align:center;';
+          listWrap.appendChild(empty);
+        }
+      };
+
+      search.addEventListener('input', () => {
+        activeIndex = 0;
+        renderList();
+      });
+      search.addEventListener('keydown', async (e) => {
+        e.stopPropagation();
+        const q = (search.value || '').trim();
+        const qLower = q.toLowerCase();
+        const filteredOpts = options.filter((opt) => !qLower || (opt.label || '').toLowerCase().includes(qLower));
+        const showCreate = !!q && sourceColl && !this._qnReferenceHasExactMatch(records, q);
+        const rowCount = filteredOpts.length + (showCreate ? 1 : 0);
+
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          if (rowCount) activeIndex = Math.min(rowCount - 1, activeIndex + 1);
+          renderList();
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          if (rowCount) activeIndex = Math.max(0, activeIndex - 1);
+          renderList();
+        } else if (e.key === 'Enter') {
+          e.preventDefault();
+          if (showCreate && activeIndex === 0) {
+            if (creating) return;
+            creating = true;
+            const created = await this._qnCreateRecordInCollection(sourceColl, q, srcName);
+            creating = false;
+            if (created?.guid) done({ displayValue: created.name, guid: created.guid });
+            else {
+              this.ui.addToaster?.({
+                title: 'Could not create record',
+                message: `Failed to create a new ${singular} in “${srcName}”.`,
+                dismissible: true,
+              });
+            }
+            return;
+          }
+          const pickIdx = showCreate ? activeIndex - 1 : activeIndex;
+          if (filteredOpts[pickIdx]) done(filteredOpts[pickIdx].value);
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          done(null);
+        }
+      });
+
+      cancelBtn.addEventListener('click', () => done(null));
+      const onOut = (e) => {
+        if (!box.contains(e.target)) done(null);
+      };
+      document.addEventListener('pointerdown', onOut, true);
+
+      renderList();
       requestAnimationFrame(() => search.focus());
     });
   }
@@ -3559,11 +3862,9 @@ class Plugin extends AppPlugin {
         if (this._qnPromptSessionRefCache) this._qnPromptSessionRefCache.set(srcName, records);
       }
       if (fieldConf.referenceMultiple === true) {
-        return this._promptReferenceMulti(fieldName, records);
+        return this._promptReferenceMulti(fieldName, records, sourceColl, srcName);
       }
-      const options    = records.map(r => ({ label: r.getName()||'Untitled', value: { displayValue: r.getName()||'Untitled', guid: r.guid } }));
-      options.push({ label: '— Skip —', value: { displayValue: '', guid: undefined } });
-      return this._pickFromDropdown(options, `Search ${fieldName}…`);
+      return this._promptReferenceSingle(fieldName, records, sourceColl, srcName);
     }
     if (type === 'choice') {
       const options = (fieldConf.choices||[]).map(c => ({ label: c, value: { displayValue: c, guid: undefined } }));
