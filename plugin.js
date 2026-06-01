@@ -1,7 +1,7 @@
 // ==Plugin==
 // name: Prompt+
 // description: Create a timestamped note in any configured collection
-// icon: ti-message-plus
+// icon: ti-sparkles
 // ==/Plugin==
 
 
@@ -2394,8 +2394,8 @@
 // @generated END thymer-plugin-settings
 
 /*
-  SIDEBAR  : Prompt+ (ti-message-plus)
-  STATUS   : same icon — one click opens the flow
+  SIDEBAR  : Prompt+ (ti-sparkles)
+  STATUS   : ti-plus — one click opens the flow
   CMD+K    : "Prompt+" | "Prompt+: Configure"
 
   Journal reference insertion is intentionally omitted — Today's Notes
@@ -2633,12 +2633,10 @@ function ensureQnTemplatesCollection(data) {
   }
   return runQnTemplatesEnsureWithLocksOrChain(data);
 }
-const QN_PLUGIN_ICON = 'ti-message-plus';
+const QN_PLUGIN_ICON = 'ti-sparkles';
 const QN_PLUGIN_NAME = 'Prompt+';
 // Experiment toggle: isolate reload lag by skipping startup template ensure.
 const QN_EXP_SKIP_STARTUP_TEMPLATE_ENSURE = true;
-// Experiment toggle: commands only (skip sidebar/statusbar item registration).
-const QN_EXP_COMMANDS_ONLY = true;
 
 class Plugin extends AppPlugin {
 
@@ -2651,6 +2649,16 @@ class Plugin extends AppPlugin {
   _invalidateQnCollListCache() {
     this._qnCollListKey = null;
     this._qnCollListCached = null;
+  }
+
+  /** Skip chained template ensure when the collection already exists (common path). */
+  async _ensureQnTemplatesCollectionFast() {
+    try {
+      const all = await this._getAllCollectionsCached();
+      if (findQnTemplatesCollectionInList(all)) return;
+    } catch (_) {}
+    await ensureQnTemplatesCollection(this.data);
+    this._invalidateQnCollListCache();
   }
 
   async _getAllCollectionsCached() {
@@ -2702,12 +2710,10 @@ class Plugin extends AppPlugin {
       this._mountConfigPanel(panel);
     });
 
-    if (!QN_EXP_COMMANDS_ONLY) {
-      this.ui.addSidebarItem({
-        icon: QN_PLUGIN_ICON, label: QN_PLUGIN_NAME, tooltip: 'Create a timestamped note',
-        onClick: () => this.run(),
-      });
-    }
+    this.ui.addSidebarItem({
+      icon: QN_PLUGIN_ICON, label: QN_PLUGIN_NAME, tooltip: 'Create a timestamped note',
+      onClick: () => this.run(),
+    });
     this._qnStatusItem = this.ui.addStatusBarItem?.({
       icon: 'ti-plus',
       tooltip: `${QN_PLUGIN_NAME} — create a timestamped note`,
@@ -2800,11 +2806,10 @@ class Plugin extends AppPlugin {
     if (!el) return;
     panel.setTitle(`${QN_PLUGIN_NAME} — Configure`);
     try {
-      await ensureQnTemplatesCollection(this.data);
+      await this._ensureQnTemplatesCollectionFast();
     } catch (_) {
       void 0;
     }
-    this._invalidateQnCollListCache();
 
     const allCollections  = await this._getAllCollectionsCached();
     const skip            = qnTemplatesSkipNamesLower();
@@ -2813,12 +2818,14 @@ class Plugin extends AppPlugin {
     const templateRecords = templatesColl ? await templatesColl.getAllRecords() : [];
     const templatesCollDisplayName = templatesColl ? (templatesColl.getName() || QN_TEMPLATES_COLL) : QN_TEMPLATES_COLL;
 
-    const collData = await Promise.all(candidates.map(async (coll) => {
-      const name   = coll.getName() || '';
-      const fields = await this._discoverFields(coll);
-      const saved  = this._config.collections[name] || {};
+    const collData = candidates.map((coll) => {
+      const name  = coll.getName() || '';
+      const saved = this._config.collections[name] || {};
       return {
-        name, allFields: fields,
+        name,
+        coll,
+        allFields: [],
+        fieldsLoaded: false,
         enabled:        saved.enabled        || false,
         promptedFields: saved.fields         || [],
         fieldConfig:    saved.fieldConfig    || {},
@@ -2828,7 +2835,7 @@ class Plugin extends AppPlugin {
         titleTemplate:  saved.titleTemplate  || '{Date}. {Time}. {Collection}',
         templateGuid:   saved.templateGuid   || '',
       };
-    }));
+    });
 
     const state      = collData.map(c => ({ ...c, promptedFields: [...c.promptedFields], fieldConfig: JSON.parse(JSON.stringify(c.fieldConfig)), autoFillFields: JSON.parse(JSON.stringify(c.autoFillFields)) }));
     let activeIndex  = null;
@@ -2866,8 +2873,18 @@ class Plugin extends AppPlugin {
       }
 
       state.forEach((item, idx) => {
-        wrap.appendChild(this._renderCollCard(item, idx, activeIndex === idx, () => {
+        wrap.appendChild(this._renderCollCard(item, idx, activeIndex === idx, async () => {
+          const opening = activeIndex !== idx;
           activeIndex = activeIndex === idx ? null : idx;
+          if (opening && item.coll && !item.fieldsLoaded) {
+            item.fieldsLoaded = true;
+            try {
+              item.allFields = await this._discoverFields(item.coll);
+            } catch (_) {
+              item.allFields = [];
+              item.fieldsLoaded = false;
+            }
+          }
           render();
         }, render, templateRecords, templatesCollDisplayName));
       });
@@ -3262,12 +3279,6 @@ class Plugin extends AppPlugin {
     this._running = true;
     this._qnPromptSessionRefCache = new Map();
     try {
-      try {
-        await ensureQnTemplatesCollection(this.data);
-      } catch (_) {
-        void 0;
-      }
-      this._invalidateQnCollListCache();
       const allCollections = await this._getAllCollectionsCached();
       const eligible       = this._getEnabledCollections(allCollections);
 
@@ -3400,6 +3411,11 @@ class Plugin extends AppPlugin {
       // Navigate to new record, then apply template if configured
       this._navigateTo(newGuid);
       if (templateGuid) {
+        try {
+          await this._ensureQnTemplatesCollectionFast();
+        } catch (_) {
+          void 0;
+        }
         await this._sleep(250); // give the record time to be available in data API
         await this._applyTemplate(templateGuid, newGuid, tokens, allCollections);
       }
@@ -3432,11 +3448,10 @@ class Plugin extends AppPlugin {
       }
 
       try {
-        await ensureQnTemplatesCollection(this.data);
+        await this._ensureQnTemplatesCollectionFast();
       } catch (_) {
         void 0;
       }
-      this._invalidateQnCollListCache();
       const allCollections = await this._getAllCollectionsCached();
       const templatesColl = findQnTemplatesCollectionInList(allCollections);
       if (!templatesColl) {
@@ -3697,68 +3712,93 @@ class Plugin extends AppPlugin {
       listWrap.style.cssText = 'flex:1;min-height:120px;max-height:260px;overflow:auto;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:4px 2px;background:rgba(6,6,10,0.24);';
       const selected = new Map();
       let creating = false;
-      const sorted = () => [...records].sort((a, b) => (a.getName() || '').localeCompare(b.getName() || '', undefined, { sensitivity: 'base' }));
+      let activeIndex = 0;
+      let visibleRows = [];
+      const sortedRecords = [...records].sort((a, b) => (a.getName() || '').localeCompare(b.getName() || '', undefined, { sensitivity: 'base' }));
+      const runCreate = async (qRaw) => {
+        if (creating || !sourceColl) return;
+        creating = true;
+        const created = await this._qnCreateRecordInCollection(sourceColl, qRaw, srcName);
+        creating = false;
+        if (created?.guid) {
+          selected.set(created.guid, created.name);
+          search.value = '';
+          activeIndex = 0;
+          renderList();
+        } else {
+          this.ui.addToaster?.({
+            title: 'Could not create record',
+            message: `Failed to create a new ${singular} in “${srcName}”.`,
+            dismissible: true,
+          });
+        }
+      };
+      const toggleRow = (row) => {
+        if (!row || row.kind !== 'record') return;
+        if (selected.has(row.guid)) selected.delete(row.guid);
+        else selected.set(row.guid, row.name);
+        const el = listWrap.querySelector(`[data-qn-guid="${row.guid}"]`);
+        const cb = el?.querySelector('input[type="checkbox"]');
+        if (cb) cb.checked = selected.has(row.guid);
+        else renderList();
+      };
       const renderList = () => {
         listWrap.innerHTML = '';
         const qRaw = (search.value || '').trim();
         const q = qRaw.toLowerCase();
         const showCreate = !!qRaw && sourceColl && !this._qnReferenceHasExactMatch(records, qRaw);
-        if (showCreate) {
-          const createBtn = document.createElement('button');
-          createBtn.type = 'button';
-          createBtn.textContent = `Create new ${singular}`;
-          createBtn.style.cssText = 'display:block;width:calc(100% - 8px);margin:4px 4px 6px;text-align:left;padding:8px 10px;border:1px dashed rgba(167,139,250,0.45);background:rgba(167,139,250,0.12);color:var(--color-primary-300,#ddd6fe);border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;';
-          createBtn.addEventListener('click', async () => {
-            if (creating) return;
-            creating = true;
-            createBtn.disabled = true;
-            const created = await this._qnCreateRecordInCollection(sourceColl, qRaw, srcName);
-            creating = false;
-            createBtn.disabled = false;
-            if (created?.guid) {
-              selected.set(created.guid, created.name);
-              search.value = '';
-              renderList();
-            } else {
-              this.ui.addToaster?.({
-                title: 'Could not create record',
-                message: `Failed to create a new ${singular} in “${srcName}”.`,
-                dismissible: true,
-              });
-            }
-          });
-          listWrap.appendChild(createBtn);
-        }
-        for (const r of sorted()) {
+        visibleRows = [];
+        if (showCreate) visibleRows.push({ kind: 'create', qRaw });
+        for (const r of sortedRecords) {
           const name = r.getName() || 'Untitled';
           if (q && !name.toLowerCase().includes(q)) continue;
-          const row = document.createElement('label');
-          row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:4px;cursor:pointer;font-size:13px;';
-          row.addEventListener('mouseenter', () => { row.style.background = 'var(--bg-hover,rgba(255,255,255,0.06))'; });
-          row.addEventListener('mouseleave', () => { row.style.background = 'transparent'; });
+          visibleRows.push({ kind: 'record', guid: r.guid, name });
+        }
+        if (activeIndex >= visibleRows.length) activeIndex = Math.max(0, visibleRows.length - 1);
+
+        visibleRows.forEach((row, idx) => {
+          if (row.kind === 'create') {
+            const createBtn = document.createElement('button');
+            createBtn.type = 'button';
+            createBtn.textContent = `Create new ${singular}`;
+            createBtn.style.cssText = 'display:block;width:calc(100% - 8px);margin:4px 4px 6px;text-align:left;padding:8px 10px;border:1px dashed rgba(167,139,250,0.45);background:rgba(167,139,250,0.12);color:var(--color-primary-300,#ddd6fe);border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;';
+            if (idx === activeIndex) createBtn.style.outline = '2px solid rgba(167,139,250,0.55)';
+            createBtn.setAttribute('data-qn-idx', String(idx));
+            createBtn.dataset.qnKind = 'create';
+            createBtn.addEventListener('click', () => runCreate(row.qRaw));
+            createBtn.addEventListener('mouseenter', () => { activeIndex = idx; this._qnHighlightListRows(listWrap, activeIndex); });
+            listWrap.appendChild(createBtn);
+            return;
+          }
+          const label = document.createElement('label');
+          label.setAttribute('data-qn-idx', String(idx));
+          label.setAttribute('data-qn-guid', row.guid);
+          label.dataset.qnKind = 'multi';
+          label.style.cssText = 'display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:4px;cursor:pointer;font-size:13px;';
+          if (idx === activeIndex) label.style.background = 'var(--bg-hover,rgba(255,255,255,0.10))';
+          label.addEventListener('mouseenter', () => { activeIndex = idx; this._qnHighlightListRows(listWrap, activeIndex); });
           const cb = document.createElement('input');
           cb.type = 'checkbox';
-          cb.checked = selected.has(r.guid);
+          cb.checked = selected.has(row.guid);
           cb.style.cssText = 'width:15px;height:15px;flex-shrink:0;cursor:pointer;accent-color:var(--color-primary-500,#a78bfa);';
           cb.addEventListener('change', () => {
-            if (cb.checked) selected.set(r.guid, name);
-            else selected.delete(r.guid);
+            if (cb.checked) selected.set(row.guid, row.name);
+            else selected.delete(row.guid);
           });
           const span = document.createElement('span');
-          span.textContent = name;
+          span.textContent = row.name;
           span.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
-          row.appendChild(cb);
-          row.appendChild(span);
-          listWrap.appendChild(row);
-        }
-        if (!listWrap.children.length) {
+          label.appendChild(cb);
+          label.appendChild(span);
+          listWrap.appendChild(label);
+        });
+        if (!visibleRows.length) {
           const empty = document.createElement('div');
           empty.textContent = records.length ? 'No matches.' : 'No records in source collection.';
           empty.style.cssText = 'padding:12px;color:var(--text-muted,#888);font-size:13px;text-align:center;';
           listWrap.appendChild(empty);
         }
       };
-      search.addEventListener('input', renderList);
       const btnRow = document.createElement('div');
       btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;flex-shrink:0;';
       const skipBtn = document.createElement('button');
@@ -3776,30 +3816,66 @@ class Plugin extends AppPlugin {
       document.body.appendChild(box);
       renderList();
       let resolved = false;
-      const done = (val) => {
-        if (resolved) return;
-        resolved = true;
-        box.remove();
-        resolve(val);
-      };
-      okBtn.addEventListener('click', () => {
+      const commitOk = () => {
         const guids = [...selected.keys()];
         const names = guids.map((g) => selected.get(g));
         done({ displayValue: names.join(', '), guids, multi: true });
-      });
+      };
+      const done = (val) => {
+        if (resolved) return;
+        resolved = true;
+        detachKeys();
+        document.removeEventListener('pointerdown', onOut, true);
+        box.remove();
+        resolve(val);
+      };
+      okBtn.addEventListener('click', () => commitOk());
       skipBtn.addEventListener('click', () => done({ displayValue: '', guids: [], multi: true }));
-      search.addEventListener('keydown', (e) => {
+      const activateRow = async () => {
+        const row = visibleRows[activeIndex];
+        if (!row) return;
+        if (row.kind === 'create') await runCreate(row.qRaw);
+        else toggleRow(row);
+      };
+      const stepRow = (delta) => {
+        if (!visibleRows.length) return;
+        activeIndex = Math.max(0, Math.min(visibleRows.length - 1, activeIndex + delta));
+        this._qnHighlightListRows(listWrap, activeIndex);
+      };
+      const scheduleRenderList = this._qnScheduleRender(() => {
+        activeIndex = 0;
+        renderList();
+      });
+      search.addEventListener('input', scheduleRenderList);
+      search.addEventListener('keydown', async (e) => {
         e.stopPropagation();
-        if (e.key === 'Escape') {
+        if (this._qnPromptModEnter(e)) {
+          e.preventDefault();
+          commitOk();
+          return;
+        }
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          stepRow(1);
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          stepRow(-1);
+        } else if (e.key === 'Enter') {
+          e.preventDefault();
+          await activateRow();
+        } else if (e.key === 'Escape') {
           e.preventDefault();
           done(null);
         }
       });
+      const detachKeys = this._qnAttachPromptKeyboardCapture(box, search, {
+        onArrowDown: () => stepRow(1),
+        onArrowUp: () => stepRow(-1),
+        onEnter: () => { void activateRow(); },
+        onModEnter: () => commitOk(),
+      });
       const onOut = (e) => {
-        if (!box.contains(e.target)) {
-          document.removeEventListener('pointerdown', onOut, true);
-          done(null);
-        }
+        if (!box.contains(e.target)) done(null);
       };
       document.addEventListener('pointerdown', onOut, true);
       requestAnimationFrame(() => search.focus());
@@ -3851,9 +3927,11 @@ class Plugin extends AppPlugin {
       let activeIndex = 0;
       let creating = false;
 
+      let detachKeys = () => {};
       const done = (val) => {
         if (resolved) return;
         resolved = true;
+        detachKeys();
         document.removeEventListener('pointerdown', onOut, true);
         box.remove();
         resolve(val);
@@ -3880,6 +3958,8 @@ class Plugin extends AppPlugin {
         rows.forEach((row, idx) => {
           const btn = document.createElement('button');
           btn.type = 'button';
+          btn.setAttribute('data-qn-idx', String(idx));
+          btn.dataset.qnKind = row.kind === 'create' ? 'create' : 'pick';
           btn.style.cssText = 'display:block;width:100%;text-align:left;padding:7px 10px;border:0;background:transparent;color:inherit;border-radius:6px;cursor:pointer;font-size:13px;';
           if (idx === activeIndex) btn.style.background = 'rgba(255,255,255,0.12)';
           if (row.kind === 'create') {
@@ -3908,7 +3988,7 @@ class Plugin extends AppPlugin {
           }
           btn.addEventListener('mouseenter', () => {
             activeIndex = idx;
-            renderList();
+            this._qnHighlightListRows(listWrap, activeIndex);
           });
           listWrap.appendChild(btn);
         });
@@ -3921,49 +4001,70 @@ class Plugin extends AppPlugin {
         }
       };
 
-      search.addEventListener('input', () => {
-        activeIndex = 0;
-        renderList();
-      });
-      search.addEventListener('keydown', async (e) => {
-        e.stopPropagation();
+      const pickActive = async () => {
+        const q = (search.value || '').trim();
+        const qLower = q.toLowerCase();
+        const filteredOpts = options.filter((opt) => !qLower || (opt.label || '').toLowerCase().includes(qLower));
+        const showCreate = !!q && sourceColl && !this._qnReferenceHasExactMatch(records, q);
+        if (showCreate && activeIndex === 0) {
+          if (creating) return;
+          creating = true;
+          const created = await this._qnCreateRecordInCollection(sourceColl, q, srcName);
+          creating = false;
+          if (created?.guid) done({ displayValue: created.name, guid: created.guid });
+          else {
+            this.ui.addToaster?.({
+              title: 'Could not create record',
+              message: `Failed to create a new ${singular} in “${srcName}”.`,
+              dismissible: true,
+            });
+          }
+          return;
+        }
+        const pickIdx = showCreate ? activeIndex - 1 : activeIndex;
+        if (filteredOpts[pickIdx]) done(filteredOpts[pickIdx].value);
+      };
+      const stepRow = (delta) => {
         const q = (search.value || '').trim();
         const qLower = q.toLowerCase();
         const filteredOpts = options.filter((opt) => !qLower || (opt.label || '').toLowerCase().includes(qLower));
         const showCreate = !!q && sourceColl && !this._qnReferenceHasExactMatch(records, q);
         const rowCount = filteredOpts.length + (showCreate ? 1 : 0);
-
+        if (!rowCount) return;
+        activeIndex = Math.max(0, Math.min(rowCount - 1, activeIndex + delta));
+        this._qnHighlightListRows(listWrap, activeIndex);
+      };
+      const scheduleRenderList = this._qnScheduleRender(() => {
+        activeIndex = 0;
+        renderList();
+      });
+      search.addEventListener('input', scheduleRenderList);
+      search.addEventListener('keydown', async (e) => {
+        e.stopPropagation();
+        if (this._qnPromptModEnter(e)) {
+          e.preventDefault();
+          await pickActive();
+          return;
+        }
         if (e.key === 'ArrowDown') {
           e.preventDefault();
-          if (rowCount) activeIndex = Math.min(rowCount - 1, activeIndex + 1);
-          renderList();
+          stepRow(1);
         } else if (e.key === 'ArrowUp') {
           e.preventDefault();
-          if (rowCount) activeIndex = Math.max(0, activeIndex - 1);
-          renderList();
+          stepRow(-1);
         } else if (e.key === 'Enter') {
           e.preventDefault();
-          if (showCreate && activeIndex === 0) {
-            if (creating) return;
-            creating = true;
-            const created = await this._qnCreateRecordInCollection(sourceColl, q, srcName);
-            creating = false;
-            if (created?.guid) done({ displayValue: created.name, guid: created.guid });
-            else {
-              this.ui.addToaster?.({
-                title: 'Could not create record',
-                message: `Failed to create a new ${singular} in “${srcName}”.`,
-                dismissible: true,
-              });
-            }
-            return;
-          }
-          const pickIdx = showCreate ? activeIndex - 1 : activeIndex;
-          if (filteredOpts[pickIdx]) done(filteredOpts[pickIdx].value);
+          await pickActive();
         } else if (e.key === 'Escape') {
           e.preventDefault();
           done(null);
         }
+      });
+      detachKeys = this._qnAttachPromptKeyboardCapture(box, search, {
+        onArrowDown: () => stepRow(1),
+        onArrowUp: () => stepRow(-1),
+        onEnter: () => { void pickActive(); },
+        onModEnter: () => { void pickActive(); },
       });
 
       cancelBtn.addEventListener('click', () => done(null));
@@ -4008,13 +4109,24 @@ class Plugin extends AppPlugin {
       let resolved = false;
       let filtered = options.slice();
       let activeIndex = 0;
+      let detachKeys = () => {};
 
       const done = (val) => {
         if (resolved) return;
         resolved = true;
+        detachKeys();
         document.removeEventListener('pointerdown', onOut, true);
         box.remove();
         resolve(val);
+      };
+
+      const pickActive = () => {
+        if (filtered[activeIndex]) done(filtered[activeIndex].value);
+      };
+      const stepRow = (delta) => {
+        if (!filtered.length) return;
+        activeIndex = Math.max(0, Math.min(filtered.length - 1, activeIndex + delta));
+        this._qnHighlightListRows(listWrap, activeIndex);
       };
 
       const renderList = () => {
@@ -4027,11 +4139,12 @@ class Plugin extends AppPlugin {
           const row = document.createElement('button');
           row.type = 'button';
           row.textContent = opt.label;
+          row.setAttribute('data-qn-idx', String(idx));
           row.style.cssText = 'display:block;width:100%;text-align:left;padding:7px 10px;border:0;background:transparent;color:inherit;border-radius:6px;cursor:pointer;font-size:13px;';
           if (idx === activeIndex) row.style.background = 'rgba(255,255,255,0.12)';
           row.addEventListener('mouseenter', () => {
             activeIndex = idx;
-            renderList();
+            this._qnHighlightListRows(listWrap, activeIndex);
           });
           row.addEventListener('click', () => done(opt.value));
           listWrap.appendChild(row);
@@ -4045,27 +4158,37 @@ class Plugin extends AppPlugin {
         }
       };
 
-      search.addEventListener('input', () => {
+      const scheduleRenderList = this._qnScheduleRender(() => {
         activeIndex = 0;
         renderList();
       });
+      search.addEventListener('input', scheduleRenderList);
       search.addEventListener('keydown', (e) => {
         e.stopPropagation();
+        if (this._qnPromptModEnter(e)) {
+          e.preventDefault();
+          pickActive();
+          return;
+        }
         if (e.key === 'ArrowDown') {
           e.preventDefault();
-          if (filtered.length) activeIndex = Math.min(filtered.length - 1, activeIndex + 1);
-          renderList();
+          stepRow(1);
         } else if (e.key === 'ArrowUp') {
           e.preventDefault();
-          if (filtered.length) activeIndex = Math.max(0, activeIndex - 1);
-          renderList();
+          stepRow(-1);
         } else if (e.key === 'Enter') {
           e.preventDefault();
-          if (filtered[activeIndex]) done(filtered[activeIndex].value);
+          pickActive();
         } else if (e.key === 'Escape') {
           e.preventDefault();
           done(null);
         }
+      });
+      detachKeys = this._qnAttachPromptKeyboardCapture(box, search, {
+        onArrowDown: () => stepRow(1),
+        onArrowUp: () => stepRow(-1),
+        onEnter: () => pickActive(),
+        onModEnter: () => pickActive(),
       });
 
       cancelBtn.addEventListener('click', () => done(null));
@@ -4205,6 +4328,99 @@ class Plugin extends AppPlugin {
       + `padding:16px;z-index:99999;display:flex;flex-direction:column;gap:10px;max-width:calc(100vw - 24px);`;
   }
 
+  _qnPromptModEnter(e) {
+    return (e.metaKey || e.ctrlKey) && !e.altKey && e.key === 'Enter';
+  }
+
+  _qnPromptIsPrintableKey(e) {
+    return e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey;
+  }
+
+  /** Route typing and list keys into the filter input when focus is elsewhere in the prompt shell. */
+  _qnAttachPromptKeyboardCapture(box, inputEl, opts = {}) {
+    const { onArrowDown, onArrowUp, onEnter, onModEnter } = opts;
+    const handler = (e) => {
+      if (!box.isConnected) {
+        document.removeEventListener('keydown', handler, true);
+        return;
+      }
+      if (this._qnPromptModEnter(e) && onModEnter) {
+        e.preventDefault();
+        e.stopPropagation();
+        onModEnter(e);
+        return;
+      }
+      const target = e.target;
+      const onInput = target === inputEl;
+      const inBox = !!(target && box.contains(target));
+
+      if (this._qnPromptIsPrintableKey(e) && !onInput) {
+        e.preventDefault();
+        e.stopPropagation();
+        inputEl.focus();
+        const start = inputEl.selectionStart ?? inputEl.value.length;
+        const end = inputEl.selectionEnd ?? start;
+        const v = inputEl.value;
+        inputEl.value = v.slice(0, start) + e.key + v.slice(end);
+        const pos = start + e.key.length;
+        inputEl.setSelectionRange(pos, pos);
+        inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+      }
+      if (e.key === 'Backspace' && !onInput && inBox) {
+        e.preventDefault();
+        e.stopPropagation();
+        inputEl.focus();
+        const start = inputEl.selectionStart ?? inputEl.value.length;
+        const end = inputEl.selectionEnd ?? start;
+        if (start === end && start > 0) {
+          inputEl.value = inputEl.value.slice(0, start - 1) + inputEl.value.slice(end);
+          inputEl.setSelectionRange(start - 1, start - 1);
+        } else if (start !== end) {
+          inputEl.value = inputEl.value.slice(0, start) + inputEl.value.slice(end);
+          inputEl.setSelectionRange(start, start);
+        }
+        inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+      }
+      if (!onInput && inBox && (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Enter')) {
+        e.preventDefault();
+        e.stopPropagation();
+        inputEl.focus();
+        if (e.key === 'ArrowDown' && onArrowDown) onArrowDown(e);
+        else if (e.key === 'ArrowUp' && onArrowUp) onArrowUp(e);
+        else if (e.key === 'Enter' && onEnter) onEnter(e);
+      }
+    };
+    document.addEventListener('keydown', handler, true);
+    return () => document.removeEventListener('keydown', handler, true);
+  }
+
+  _qnScheduleRender(fn) {
+    let scheduled = false;
+    return () => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => {
+        scheduled = false;
+        fn();
+      });
+    };
+  }
+
+  _qnHighlightListRows(listWrap, activeIndex) {
+    listWrap.querySelectorAll('[data-qn-idx]').forEach((el) => {
+      const on = Number(el.getAttribute('data-qn-idx')) === activeIndex;
+      if (el.dataset.qnKind === 'create') {
+        el.style.outline = on ? '2px solid rgba(167,139,250,0.55)' : '';
+      } else if (el.dataset.qnKind === 'multi') {
+        el.style.background = on ? 'var(--bg-hover,rgba(255,255,255,0.10))' : 'transparent';
+      } else {
+        el.style.background = on ? 'rgba(255,255,255,0.12)' : 'transparent';
+      }
+    });
+  }
+
   _promptDate(fieldName, fieldConf, fieldMeta, conf) {
     return new Promise((resolve) => {
       const { includeTime: initialInclude, locked } = this._datePromptTimeMode(fieldConf, fieldMeta, conf);
@@ -4259,9 +4475,12 @@ class Plugin extends AppPlugin {
       box.appendChild(btnRow);
       document.body.appendChild(box);
       let resolved = false;
+      let detachKeys = () => {};
       const done = (val) => {
         if (resolved) return;
         resolved = true;
+        detachKeys();
+        document.removeEventListener('pointerdown', onOut, true);
         box.remove();
         resolve(val);
       };
@@ -4296,7 +4515,7 @@ class Plugin extends AppPlugin {
       skipBtn.addEventListener('click', () => done({ displayValue: '', guid: undefined }));
       inp.addEventListener('keydown', (e) => {
         e.stopPropagation();
-        if (e.key === 'Enter') {
+        if (e.key === 'Enter' || this._qnPromptModEnter(e)) {
           e.preventDefault();
           commit();
         }
@@ -4305,11 +4524,9 @@ class Plugin extends AppPlugin {
           done(null);
         }
       });
+      detachKeys = this._qnAttachPromptKeyboardCapture(box, inp, { onModEnter: () => commit() });
       const onOut = (e) => {
-        if (!box.contains(e.target)) {
-          document.removeEventListener('pointerdown', onOut, true);
-          done(null);
-        }
+        if (!box.contains(e.target)) done(null);
       };
       document.addEventListener('pointerdown', onOut, true);
       requestAnimationFrame(() => inp.focus());
@@ -4332,11 +4549,14 @@ class Plugin extends AppPlugin {
       box.appendChild(lbl); box.appendChild(inp); box.appendChild(btnRow);
       document.body.appendChild(box);
       let resolved=false;
-      const done=(val)=>{ if (resolved) return; resolved=true; box.remove(); resolve(val); };
-      okBtn.addEventListener('click', ()=>done({displayValue:inp.value.trim(),guid:undefined}));
+      let detachKeys = () => {};
+      const commit = () => done({ displayValue: inp.value.trim(), guid: undefined });
+      const done=(val)=>{ if (resolved) return; resolved=true; detachKeys(); document.removeEventListener('pointerdown',onOut,true); box.remove(); resolve(val); };
+      okBtn.addEventListener('click', () => commit());
       skipBtn.addEventListener('click', ()=>done({displayValue:'',guid:undefined}));
-      inp.addEventListener('keydown', (e)=>{ e.stopPropagation(); if (e.key==='Enter'){e.preventDefault();done({displayValue:inp.value.trim(),guid:undefined});} if (e.key==='Escape'){e.preventDefault();done(null);} });
-      const onOut=(e)=>{ if (!box.contains(e.target)){document.removeEventListener('pointerdown',onOut,true);done(null);} };
+      inp.addEventListener('keydown', (e)=>{ e.stopPropagation(); if (e.key==='Enter'||this._qnPromptModEnter(e)){e.preventDefault();commit();} if (e.key==='Escape'){e.preventDefault();done(null);} });
+      detachKeys = this._qnAttachPromptKeyboardCapture(box, inp, { onModEnter: () => commit() });
+      const onOut=(e)=>{ if (!box.contains(e.target)) done(null); };
       document.addEventListener('pointerdown',onOut,true);
       requestAnimationFrame(()=>inp.focus());
     });

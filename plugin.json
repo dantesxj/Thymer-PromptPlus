@@ -1,7 +1,7 @@
 {
 	"ver": 1,
 	"name": "Prompt+",
-	"icon": "ti-atom",
+	"icon": "ti-sparkles",
 	"item_name": "Note",
 	"description": "Add templated Notes with per-Collection Property Prompts & Auto-fills",
 	"show_sidebar_items": true,
