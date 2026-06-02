@@ -2395,7 +2395,7 @@
 
 /*
   SIDEBAR  : Prompt+ (ti-sparkles)
-  STATUS   : ti-plus — one click opens the flow
+  STATUS   : ti-sparkles — one click opens the flow
   CMD+K    : "Prompt+" | "Prompt+: Configure"
 
   Journal reference insertion is intentionally omitted — Today's Notes
@@ -2715,7 +2715,7 @@ class Plugin extends AppPlugin {
       onClick: () => this.run(),
     });
     this._qnStatusItem = this.ui.addStatusBarItem?.({
-      icon: 'ti-plus',
+      icon: QN_PLUGIN_ICON,
       tooltip: `${QN_PLUGIN_NAME} — create a timestamped note`,
       onClick: () => this.run(),
     }) ?? null;
