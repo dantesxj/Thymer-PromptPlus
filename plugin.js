@@ -76,28 +76,122 @@
   const MOBILE_GRACE_UNTIL_KEY = '__thymerExtMobileGraceUntil';
   const MOBILE_HIDDEN_AT_KEY = '__thymerExtMobileHiddenAt';
   const MOBILE_INTERACT_THROTTLE_AT_KEY = '__thymerExtMobileInteractThrottleAt';
-  /** Pause footer scans / Path B until host sidebar is up — keep short so navigation is not blocked for ~2 min. */
-  const MOBILE_GRACE_MS = 45000;
-  const MOBILE_RESUME_GRACE_MS = 35000;
+  /** Mobile: brief bootstrap — end early on first user interaction (see endMobileLoadGrace). */
+  const MOBILE_GRACE_MS = 6000;
+  const MOBILE_RESUME_GRACE_MS = 6000;
   const MOBILE_RESUME_AWAY_MS = 15000;
-  /** Interaction only pauses the heavy-work queue briefly — do not extend MOBILE_GRACE (that delayed page change until ~2 min). */
-  const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 10000;
+  /** Interaction only pauses the heavy-work queue briefly — do not extend MOBILE_GRACE. */
+  const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 5000;
+  /** Desktop: brief heavy-work pause after first click during startup storm. */
+  const DESKTOP_HEAVY_PAUSE_ON_INTERACT_MS = 6000;
   const MOBILE_INTERACTION_THROTTLE_MS = 2500;
   const HEAVY_QUEUE_PAUSED_UNTIL_KEY = '__thymerExtHeavyQueuePausedUntil';
+
+  /** Cross-platform: defer vault scans / footer data populate while Thymer syncs; shells may still mount. */
+  const STARTUP_STORM_UNTIL_KEY = '__thymerExtStartupStormUntil';
+  const STARTUP_STORM_MOBILE_MS = 14000;
+  const STARTUP_STORM_DESKTOP_MS = 14000;
 
   // Heavy work scheduler: many plugins "wake up" together after mobile grace ends.
   // Running them concurrently causes long-task storms that block navigation.
   const HEAVY_Q_KEY = '__thymerExtHeavyWorkQueue';
   const HEAVY_BUSY_KEY = '__thymerExtHeavyWorkBusy';
 
+  function ensureStartupStormWindow(extraMs) {
+    const ms =
+      extraMs > 0
+        ? extraMs
+        : preferDeferredHeavyWork()
+          ? STARTUP_STORM_MOBILE_MS
+          : STARTUP_STORM_DESKTOP_MS;
+    const until = Date.now() + ms;
+    try {
+      if (!g[STARTUP_STORM_UNTIL_KEY] || g[STARTUP_STORM_UNTIL_KEY] < until) {
+        g[STARTUP_STORM_UNTIL_KEY] = until;
+      }
+    } catch (_) {}
+    installStartupStormInteractionListener();
+  }
+
+  function inStartupStormWindow() {
+    try {
+      return Date.now() < (g[STARTUP_STORM_UNTIL_KEY] || 0);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function endStartupStormWindow() {
+    try {
+      g[STARTUP_STORM_UNTIL_KEY] = 0;
+    } catch (_) {}
+  }
+
+  function scheduleAfterStartupStorm(run, opts) {
+    if (typeof run !== 'function') return;
+    if (!inStartupStormWindow()) {
+      try {
+        run();
+      } catch (_) {}
+      return;
+    }
+    const pollMs = Math.max(120, Number(opts?.pollMs) || 400);
+    const maxWaitMs = Math.max(pollMs, Number(opts?.maxWaitMs) || 120000);
+    const started = Date.now();
+    const tick = () => {
+      if (!inStartupStormWindow() || Date.now() - started >= maxWaitMs) {
+        try {
+          run();
+        } catch (_) {}
+        return;
+      }
+      setTimeout(tick, pollMs);
+    };
+    setTimeout(tick, pollMs);
+  }
+
+  function endMobileLoadGrace() {
+    try {
+      g[MOBILE_GRACE_UNTIL_KEY] = 0;
+    } catch (_) {}
+  }
+
+  function installStartupStormInteractionListener() {
+    g.__thymerExtStormOnInteract = () => {
+      try {
+        endStartupStormWindow();
+        endMobileLoadGrace();
+        pauseHeavyWorkQueue(
+          preferDeferredHeavyWork() ? MOBILE_HEAVY_PAUSE_ON_INTERACT_MS : DESKTOP_HEAVY_PAUSE_ON_INTERACT_MS
+        );
+      } catch (_) {}
+    };
+    if (g.__thymerExtStormInteractInstalled) return;
+    g.__thymerExtStormInteractInstalled = true;
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+    const onInteract = () => {
+      try {
+        g.__thymerExtStormOnInteract?.();
+      } catch (_) {}
+    };
+    for (const ev of ['pointerdown', 'touchstart', 'keydown']) {
+      try {
+        document.addEventListener(ev, onInteract, { passive: true, capture: true });
+      } catch (_) {}
+    }
+  }
+
   function ensureMobileLoadGraceStarted(extraMs) {
     if (!preferDeferredHeavyWork()) return;
+    ensureStartupStormWindow();
     const until = Date.now() + (extraMs > 0 ? extraMs : MOBILE_GRACE_MS);
     try {
       if (!g[MOBILE_GRACE_UNTIL_KEY] || g[MOBILE_GRACE_UNTIL_KEY] < until) {
         g[MOBILE_GRACE_UNTIL_KEY] = until;
       }
     } catch (_) {}
+    installStartupStormInteractionListener();
+    installMobileInteractionGraceListener();
   }
 
   function inMobileLoadGrace() {
@@ -158,9 +252,36 @@
     }
   }
 
-  /** True during startup window: skip footer mount / panel scans so page navigation stays responsive. */
+  /**
+   * True during the brief startup window — use only to skip *background* sync scans,
+   * not user-initiated panel.navigated mounts (those should still schedule with debounce).
+   */
   function shouldDeferPanelFooterWork() {
     return inMobileLoadGrace();
+  }
+
+  /** Run `fn` now, or poll until mobile load grace ends (for one-shot startup scans that must not be dropped). */
+  function scheduleAfterMobileLoadGrace(run, opts) {
+    if (typeof run !== 'function') return;
+    if (!preferDeferredHeavyWork() || !inMobileLoadGrace()) {
+      try {
+        run();
+      } catch (_) {}
+      return;
+    }
+    const pollMs = Math.max(120, Number(opts?.pollMs) || 350);
+    const maxWaitMs = Math.max(pollMs, Number(opts?.maxWaitMs) || 90000);
+    const started = Date.now();
+    const tick = () => {
+      if (!inMobileLoadGrace() || Date.now() - started >= maxWaitMs) {
+        try {
+          run();
+        } catch (_) {}
+        return;
+      }
+      setTimeout(tick, pollMs);
+    };
+    setTimeout(tick, pollMs);
   }
 
   function installMobileInteractionGraceListener() {
@@ -175,6 +296,8 @@
         const prev = g[MOBILE_INTERACT_THROTTLE_AT_KEY] || 0;
         if (now - prev < MOBILE_INTERACTION_THROTTLE_MS) return;
         g[MOBILE_INTERACT_THROTTLE_AT_KEY] = now;
+        endStartupStormWindow();
+        endMobileLoadGrace();
         pauseHeavyWorkQueue(MOBILE_HEAVY_PAUSE_ON_INTERACT_MS);
       } catch (_) {}
     };
@@ -227,7 +350,7 @@
       g[HEAVY_BUSY_KEY] = false;
       // If we stopped due to grace, try again later.
       if (Array.isArray(g[HEAVY_Q_KEY]) && g[HEAVY_Q_KEY].length) {
-        setTimeout(() => runNextHeavyWork(), 1500);
+        setTimeout(() => runNextHeavyWork(), inMobileLoadGrace() ? 450 : 200);
       }
     }
   }
@@ -2220,7 +2343,7 @@
     installMobileResumeGraceListener,
 
     async init(opts) {
-      ensureMobileLoadGraceStarted();
+      ensureStartupStormWindow();
       installMobileResumeGraceListener();
       installMobileInteractionGraceListener();
       await yieldToHostBeforePathB();
@@ -2384,6 +2507,7 @@
 
   g.thymerExtEnsureMobileLoadGrace = ensureMobileLoadGraceStarted;
   g.thymerExtInMobileLoadGrace = inMobileLoadGrace;
+  g.thymerExtEndMobileLoadGrace = endMobileLoadGrace;
   g.thymerExtPreferDeferredHeavyWork = preferDeferredHeavyWork;
   g.thymerExtShouldDeferPanelFooterWork = shouldDeferPanelFooterWork;
   g.thymerExtBumpMobileLoadGrace = bumpMobileLoadGrace;
@@ -2391,6 +2515,11 @@
   g.thymerExtInstallMobileResumeGrace = installMobileResumeGraceListener;
   g.thymerExtInstallMobileInteractionGrace = installMobileInteractionGraceListener;
   g.thymerExtEnqueueHeavyWork = enqueueHeavyWork;
+  g.thymerExtScheduleAfterMobileLoadGrace = scheduleAfterMobileLoadGrace;
+  g.thymerExtEnsureStartupStormWindow = ensureStartupStormWindow;
+  g.thymerExtInStartupStormWindow = inStartupStormWindow;
+  g.thymerExtEndStartupStormWindow = endStartupStormWindow;
+  g.thymerExtScheduleAfterStartupStorm = scheduleAfterStartupStorm;
 })(typeof globalThis !== 'undefined' ? globalThis : window);
 // @generated END thymer-plugin-settings
 
@@ -2675,6 +2804,7 @@ class Plugin extends AppPlugin {
   }
 
   async _qnDeferredPathBBoot() {
+    await (globalThis.ThymerPluginSettings?.yieldToHostBeforePathB?.() ?? Promise.resolve());
     await (globalThis.ThymerPluginSettings?.init?.({
       plugin: this,
       pluginId: 'quick-notes',
@@ -2691,18 +2821,22 @@ class Plugin extends AppPlugin {
         console.warn(`[${QN_PLUGIN_NAME}] ensure templates collection`, e);
       }
     }
+    this._config = this._loadConfig();
+  }
+
+  /** Path B init on demand — not on journal startup. */
+  _qnEnsurePathBReady() {
+    if (this._qnPathBReadyPromise) return this._qnPathBReadyPromise;
+    this._qnPathBReadyPromise = this._qnDeferredPathBBoot().catch(() => {});
+    return this._qnPathBReadyPromise;
   }
 
   async onLoad() {
-    const deferPathB =
-      (typeof globalThis.ThymerPluginSettings?.preferDeferredHeavyWork === 'function' &&
-        globalThis.ThymerPluginSettings.preferDeferredHeavyWork()) ||
-      (typeof globalThis.thymerExtInMobileLoadGrace === 'function' && globalThis.thymerExtInMobileLoadGrace());
-    if (deferPathB) {
-      void this._qnDeferredPathBBoot();
-    } else {
-      await this._qnDeferredPathBBoot();
-    }
+    try {
+      globalThis.thymerExtEnsureMobileLoadGrace?.();
+      globalThis.thymerExtEnsureStartupStormWindow?.();
+    } catch (_) {}
+    this._qnPathBReadyPromise = null;
     this._eventHandlerIds = [];
     this._running         = false; // guard against double-trigger
     this._config          = this._loadConfig();
@@ -2740,14 +2874,16 @@ class Plugin extends AppPlugin {
       label: `${QN_PLUGIN_NAME}: Storage location…`,
       icon: 'ti-database',
       onSelected: () => {
-        globalThis.ThymerPluginSettings?.openStorageDialog?.({
-          plugin: this,
-          pluginId: 'quick-notes',
-          modeKey: 'thymerext_ps_mode_quick_notes',
-          mirrorKeys: () => [QN_STORAGE_KEY],
-          label: QN_PLUGIN_NAME,
-          data: this.data,
-          ui: this.ui,
+        void this._qnEnsurePathBReady().then(() => {
+          globalThis.ThymerPluginSettings?.openStorageDialog?.({
+            plugin: this,
+            pluginId: 'quick-notes',
+            modeKey: 'thymerext_ps_mode_quick_notes',
+            mirrorKeys: () => [QN_STORAGE_KEY],
+            label: QN_PLUGIN_NAME,
+            data: this.data,
+            ui: this.ui,
+          });
         });
       },
     });
@@ -2790,7 +2926,9 @@ class Plugin extends AppPlugin {
       this._config.savedAt = new Date().toISOString();
     } catch (_) {}
     try { localStorage.setItem(QN_STORAGE_KEY, JSON.stringify(this._config)); } catch (_) {}
-    globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => [QN_STORAGE_KEY]);
+    void this._qnEnsurePathBReady().then(() => {
+      globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => [QN_STORAGE_KEY]);
+    });
   }
 
   // =========================================================================
@@ -2798,6 +2936,7 @@ class Plugin extends AppPlugin {
   // =========================================================================
 
   async openConfigPanel() {
+    await this._qnEnsurePathBReady();
     const panel = await this.ui.createPanel();
     if (panel) panel.navigateToCustomType('qn-configure');
   }
