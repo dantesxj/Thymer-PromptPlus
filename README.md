@@ -13,7 +13,7 @@ Create notes in configured collections with prompted fields, tokenized titles, a
   - `{Date}`, `{Time}`, `{Collection}`, and prompted field tokens.
 - Prompted field types:
   - text
-  - choice
+  - choice (pulls from collection field choices; optional extras; add new choices at prompt time when the schema field is `choice`)
   - reference (including multi-reference selection)
   - date/datetime prompt flow
 - Body templates copied from the **Prompt+ Templates** collection (auto-created on load; existing workspaces may still use the legacy name **Quick Note Templates**).

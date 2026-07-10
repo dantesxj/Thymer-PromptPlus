@@ -3163,7 +3163,22 @@ class Plugin extends AppPlugin {
         cfg.appendChild(this._miniRow('Source collection', this._miniInput(fconf.sourceCollection||'People', v => { item.fieldConfig[fname]=item.fieldConfig[fname]||{}; item.fieldConfig[fname].sourceCollection=v; })));
         cfg.appendChild(this._miniRow('Allow multiple', this._miniCheckbox(!!fconf.referenceMultiple, v => { item.fieldConfig[fname]=item.fieldConfig[fname]||{}; item.fieldConfig[fname].referenceMultiple=v; })));
       }
-      if ((fconf.type||'text')==='choice')    cfg.appendChild(this._miniRow('Choices (comma-sep)', this._miniInput((fconf.choices||[]).join(', '), v => { item.fieldConfig[fname]=item.fieldConfig[fname]||{}; item.fieldConfig[fname].choices=v.split(',').map(s=>s.trim()).filter(Boolean); })));
+      if ((fconf.type||'text')==='choice') {
+        const schemaField = item.allFields.find((af) => af.name === fname);
+        const fromColl = schemaField?.type === 'choice';
+        if (fromColl) {
+          cfg.appendChild(this._miniRow('Choices', (() => {
+            const span = document.createElement('span');
+            span.textContent = 'From collection field (+ extras below)';
+            span.style.cssText = 'font-size:12px;color:var(--text-muted,#8a7e6a);';
+            return span;
+          })()));
+        }
+        cfg.appendChild(this._miniRow(fromColl ? 'Extra choices' : 'Choices (comma-sep)', this._miniInput((fconf.choices||[]).join(', '), v => { item.fieldConfig[fname]=item.fieldConfig[fname]||{}; item.fieldConfig[fname].choices=v.split(',').map(s=>s.trim()).filter(Boolean); })));
+        if (fromColl) {
+          cfg.appendChild(this._miniRow('Allow new choice', this._miniCheckbox(fconf.allowNewChoice !== false, v => { item.fieldConfig[fname]=item.fieldConfig[fname]||{}; item.fieldConfig[fname].allowNewChoice=v; })));
+        }
+      }
       const ord = document.createElement('div');
       ord.style.cssText='display:flex;flex-direction:column;gap:2px;flex-shrink:0;';
       ord.appendChild(this._tinyBtn('↑', fi===0, () => { [item.promptedFields[fi-1],item.promptedFields[fi]]=[item.promptedFields[fi],item.promptedFields[fi-1]]; rerender(); }));
@@ -3451,7 +3466,8 @@ class Plugin extends AppPlugin {
           conf.fieldConfig?.[fieldName] || {},
           allCollections,
           fieldMetaByName[fieldName],
-          conf
+          conf,
+          chosen
         );
         if (value === null) return;
         fieldValues[fieldName] = value;
@@ -3525,6 +3541,10 @@ class Plugin extends AppPlugin {
             }
             if (val.guid !== undefined && val.guid !== null) {
               prop.set(val.guid);
+              continue;
+            }
+            if (val.isChoice === true) {
+              this._qnSetChoiceOnProp(prop, val.displayValue);
               continue;
             }
             if (val.dateValue instanceof Date && !isNaN(val.dateValue.getTime())) {
@@ -3786,6 +3806,109 @@ class Plugin extends AppPlugin {
     try {
       prop.set(guids.join(','));
     } catch (_) {}
+  }
+
+  _qnColorForSlug(slug) {
+    const colors = ['0', '1', '2', '3', '4', '5', '6', '7'];
+    let h = 0;
+    const s = String(slug || '');
+    for (let i = 0; i < s.length; i++) h = (h + s.charCodeAt(i) * (i + 1)) % colors.length;
+    return colors[h];
+  }
+
+  _qnNormalizeChoiceOption(c) {
+    if (c == null) return null;
+    if (typeof c === 'string') {
+      const s = c.trim();
+      if (!s) return null;
+      return { id: s, label: s, color: this._qnColorForSlug(s), active: true };
+    }
+    const id = String(c.id ?? c.label ?? '').trim();
+    if (!id) return null;
+    return {
+      id,
+      label: String(c.label ?? id).trim() || id,
+      color: String(c.color != null ? c.color : this._qnColorForSlug(id)),
+      active: c.active !== false,
+    };
+  }
+
+  _qnGetCollectionFieldDef(coll, fieldName) {
+    if (!coll || typeof coll.getConfiguration !== 'function') return null;
+    try {
+      const fields = coll.getConfiguration()?.fields || [];
+      const name = String(fieldName || '').trim();
+      return fields.find((f) => (f.label || f.id || '') === name) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _qnBuildChoiceOptions(coll, fieldName, fieldConf) {
+    const options = [];
+    const seen = new Set();
+    const push = (label) => {
+      const s = String(label || '').trim();
+      if (!s || seen.has(s.toLowerCase())) return;
+      seen.add(s.toLowerCase());
+      options.push({ label: s, value: { displayValue: s, guid: undefined, isChoice: true } });
+    };
+    const fieldDef = this._qnGetCollectionFieldDef(coll, fieldName);
+    if (fieldDef && fieldDef.type === 'choice' && Array.isArray(fieldDef.choices)) {
+      for (const c of fieldDef.choices) {
+        const n = this._qnNormalizeChoiceOption(c);
+        if (n && n.active !== false) push(n.label);
+      }
+    }
+    for (const c of (fieldConf.choices || [])) {
+      push(typeof c === 'string' ? c : (c?.label || c?.id));
+    }
+    return { options, fieldDef };
+  }
+
+  _qnChoiceHasExactMatch(options, query) {
+    const q = (query || '').trim().toLowerCase();
+    if (!q) return false;
+    return options.some((opt) => (opt.label || '').trim().toLowerCase() === q);
+  }
+
+  async _qnAddChoiceToCollectionField(coll, fieldName, label) {
+    const name = String(label || '').trim();
+    if (!coll || !name || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') return null;
+    try {
+      const base = coll.getConfiguration() || {};
+      const fields = Array.isArray(base.fields) ? base.fields.map((f) => ({ ...f })) : [];
+      const idx = fields.findIndex((f) => (f.label || f.id || '') === fieldName);
+      if (idx < 0) return null;
+      const prev = fields[idx];
+      if (prev.type !== 'choice') return null;
+      const choices = Array.isArray(prev.choices)
+        ? prev.choices.map((c) => this._qnNormalizeChoiceOption(c)).filter(Boolean)
+        : [];
+      const lower = name.toLowerCase();
+      const existing = choices.find((c) => (c.label || '').toLowerCase() === lower || (c.id || '').toLowerCase() === lower);
+      if (existing) return { displayValue: existing.label, isChoice: true, added: false };
+      let slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'choice';
+      if (choices.some((c) => c.id === slug)) slug = `${slug}_${Date.now()}`;
+      const newOpt = { id: slug, label: name, color: this._qnColorForSlug(slug), active: true };
+      choices.push(newOpt);
+      fields[idx] = { ...prev, choices };
+      const ok = await coll.saveConfiguration({ ...base, fields });
+      if (ok === false) return null;
+      return { displayValue: newOpt.label, isChoice: true, added: true };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _qnSetChoiceOnProp(prop, label) {
+    if (!prop || label == null || label === '') return;
+    const s = String(label).trim();
+    if (!s) return;
+    try {
+      if (typeof prop.setChoice === 'function' && prop.setChoice(s)) return;
+    } catch (_) {}
+    try { prop.set(s); } catch (_) {}
   }
 
   _qnCollectionSingular(coll, fallbackName) {
@@ -4218,6 +4341,209 @@ class Plugin extends AppPlugin {
     });
   }
 
+  _promptChoiceSingle(fieldName, options, coll, fieldDef, allowNew) {
+    const canCreate = allowNew !== false && fieldDef?.type === 'choice' && coll;
+    const pickOptions = options.slice();
+    pickOptions.push({ label: '— Skip —', value: { displayValue: '', guid: undefined, isChoice: true } });
+
+    return new Promise((resolve) => {
+      const panel = this.ui.getActivePanel();
+      const { left, top, width } = this._qnPromptShellPosition(panel, 360, 12);
+      const box = document.createElement('div');
+      box.style.cssText = this._qnFrostedPromptShellStyle(left, top, width)
+        + 'max-height:min(460px,calc(100vh - 24px));padding:14px;box-sizing:border-box;';
+
+      const lbl = document.createElement('div');
+      lbl.textContent = fieldName;
+      lbl.style.cssText = 'font-weight:600;font-size:14px;flex-shrink:0;';
+
+      const search = document.createElement('input');
+      search.type = 'text';
+      search.placeholder = `Search ${fieldName}…`;
+      search.style.cssText = 'width:100%;padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.16);background:rgba(8,8,12,0.34);color:inherit;font-size:13px;box-sizing:border-box;outline:none;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);';
+
+      const listWrap = document.createElement('div');
+      listWrap.style.cssText = 'flex:1;min-height:140px;max-height:280px;overflow:auto;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:4px 2px;background:rgba(6,6,10,0.24);';
+
+      const btnRow = document.createElement('div');
+      btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;flex-shrink:0;';
+      const cancelBtn = document.createElement('button');
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.style.cssText = this._btnStyle('secondary');
+      btnRow.appendChild(cancelBtn);
+
+      box.appendChild(lbl);
+      box.appendChild(search);
+      box.appendChild(listWrap);
+      box.appendChild(btnRow);
+      document.body.appendChild(box);
+
+      let resolved = false;
+      let filtered = pickOptions.slice();
+      let activeIndex = 0;
+      let creating = false;
+      let liveOptions = pickOptions.slice();
+
+      let detachKeys = () => {};
+      const done = (val) => {
+        if (resolved) return;
+        resolved = true;
+        detachKeys();
+        document.removeEventListener('pointerdown', onOut, true);
+        box.remove();
+        resolve(val);
+      };
+
+      const renderList = () => {
+        listWrap.innerHTML = '';
+        const q = (search.value || '').trim();
+        const qLower = q.toLowerCase();
+        filtered = liveOptions.filter((opt) => !qLower || (opt.label || '').toLowerCase().includes(qLower));
+        const rows = [];
+        const showCreate = canCreate && !!q && !this._qnChoiceHasExactMatch(liveOptions, q);
+        if (showCreate) {
+          rows.push({ kind: 'create', label: 'Add new choice', sub: q });
+        }
+        for (const opt of filtered) rows.push({ kind: 'pick', opt });
+
+        if (activeIndex >= rows.length) activeIndex = Math.max(0, rows.length - 1);
+
+        rows.forEach((row, idx) => {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.setAttribute('data-qn-idx', String(idx));
+          btn.dataset.qnKind = row.kind === 'create' ? 'create' : 'pick';
+          btn.style.cssText = 'display:block;width:100%;text-align:left;padding:7px 10px;border:0;background:transparent;color:inherit;border-radius:6px;cursor:pointer;font-size:13px;';
+          if (idx === activeIndex) btn.style.background = 'rgba(255,255,255,0.12)';
+          if (row.kind === 'create') {
+            btn.innerHTML = `<span style="font-weight:600;color:var(--color-primary-400,#c4b5fd);">${row.label}</span>`
+              + `<span style="display:block;font-size:12px;color:var(--text-muted,#a1a1aa);margin-top:2px;">“${row.sub}”</span>`;
+            btn.addEventListener('click', async () => {
+              if (creating) return;
+              creating = true;
+              btn.disabled = true;
+              const created = await this._qnAddChoiceToCollectionField(coll, fieldName, q);
+              creating = false;
+              if (created) {
+                if (created.added) {
+                  liveOptions.splice(liveOptions.length - 1, 0, {
+                    label: created.displayValue,
+                    value: { displayValue: created.displayValue, guid: undefined, isChoice: true },
+                  });
+                }
+                done(created);
+              } else {
+                btn.disabled = false;
+                this.ui.addToaster?.({
+                  title: 'Could not add choice',
+                  message: `Failed to add “${q}” to field “${fieldName}”.`,
+                  dismissible: true,
+                });
+              }
+            });
+          } else {
+            btn.textContent = row.opt.label;
+            btn.addEventListener('click', () => done(row.opt.value));
+          }
+          btn.addEventListener('mouseenter', () => {
+            activeIndex = idx;
+            this._qnHighlightListRows(listWrap, activeIndex);
+          });
+          listWrap.appendChild(btn);
+        });
+
+        if (!rows.length) {
+          const empty = document.createElement('div');
+          empty.textContent = liveOptions.length > 1 ? 'No matches.' : 'No choices configured.';
+          empty.style.cssText = 'padding:12px;color:var(--text-muted,#888);font-size:13px;text-align:center;';
+          listWrap.appendChild(empty);
+        }
+      };
+
+      const pickActive = async () => {
+        const q = (search.value || '').trim();
+        const qLower = q.toLowerCase();
+        const filteredOpts = liveOptions.filter((opt) => !qLower || (opt.label || '').toLowerCase().includes(qLower));
+        const showCreate = canCreate && !!q && !this._qnChoiceHasExactMatch(liveOptions, q);
+        if (showCreate && activeIndex === 0) {
+          if (creating) return;
+          creating = true;
+          const created = await this._qnAddChoiceToCollectionField(coll, fieldName, q);
+          creating = false;
+          if (created) {
+            if (created.added) {
+              liveOptions.splice(liveOptions.length - 1, 0, {
+                label: created.displayValue,
+                value: { displayValue: created.displayValue, guid: undefined, isChoice: true },
+              });
+            }
+            done(created);
+          } else {
+            this.ui.addToaster?.({
+              title: 'Could not add choice',
+              message: `Failed to add “${q}” to field “${fieldName}”.`,
+              dismissible: true,
+            });
+          }
+          return;
+        }
+        const pickIdx = showCreate ? activeIndex - 1 : activeIndex;
+        if (filteredOpts[pickIdx]) done(filteredOpts[pickIdx].value);
+      };
+      const stepRow = (delta) => {
+        const q = (search.value || '').trim();
+        const qLower = q.toLowerCase();
+        const filteredOpts = liveOptions.filter((opt) => !qLower || (opt.label || '').toLowerCase().includes(qLower));
+        const showCreate = canCreate && !!q && !this._qnChoiceHasExactMatch(liveOptions, q);
+        const rowCount = filteredOpts.length + (showCreate ? 1 : 0);
+        if (!rowCount) return;
+        activeIndex = Math.max(0, Math.min(rowCount - 1, activeIndex + delta));
+        this._qnHighlightListRows(listWrap, activeIndex);
+      };
+      const scheduleRenderList = this._qnScheduleRender(() => {
+        activeIndex = 0;
+        renderList();
+      });
+      search.addEventListener('input', scheduleRenderList);
+      search.addEventListener('keydown', async (e) => {
+        e.stopPropagation();
+        if (this._qnPromptModEnter(e)) {
+          e.preventDefault();
+          await pickActive();
+          return;
+        }
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          stepRow(1);
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          stepRow(-1);
+        } else if (e.key === 'Enter') {
+          e.preventDefault();
+          await pickActive();
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          done(null);
+        }
+      });
+      detachKeys = this._qnAttachPromptKeyboardCapture(box, search, {
+        onArrowDown: () => stepRow(1),
+        onArrowUp: () => stepRow(-1),
+        onEnter: () => { void pickActive(); },
+        onModEnter: () => { void pickActive(); },
+      });
+
+      cancelBtn.addEventListener('click', () => done(null));
+      const onOut = (e) => {
+        if (!box.contains(e.target)) done(null);
+      };
+      document.addEventListener('pointerdown', onOut, true);
+
+      renderList();
+      requestAnimationFrame(() => search.focus());
+    });
+  }
+
   _pickFromDropdown(options, placeholder) {
     return new Promise((resolve) => {
       const panel = this.ui.getActivePanel();
@@ -4370,7 +4696,7 @@ class Plugin extends AppPlugin {
     return { includeTime, locked: null };
   }
 
-  async _promptField(fieldName, fieldConf, allCollections, fieldMeta, conf) {
+  async _promptField(fieldName, fieldConf, allCollections, fieldMeta, conf, targetColl) {
     if (this._shouldPromptWithDatePicker(fieldName, fieldConf, fieldMeta, conf)) {
       return this._promptDate(fieldName, fieldConf, fieldMeta, conf);
     }
@@ -4391,9 +4717,12 @@ class Plugin extends AppPlugin {
       return this._promptReferenceSingle(fieldName, records, sourceColl, srcName);
     }
     if (type === 'choice') {
-      const options = (fieldConf.choices||[]).map(c => ({ label: c, value: { displayValue: c, guid: undefined } }));
-      options.push({ label: '— Skip —', value: { displayValue: '', guid: undefined } });
-      return this._pickFromDropdown(options, `Choose ${fieldName}…`);
+      const { options, fieldDef } = this._qnBuildChoiceOptions(targetColl, fieldName, fieldConf);
+      const allowNew = fieldConf.allowNewChoice !== false;
+      if (fieldDef?.type === 'choice' || options.length > 0) {
+        return this._promptChoiceSingle(fieldName, options, targetColl, fieldDef, allowNew);
+      }
+      return this._promptText(fieldName);
     }
     return this._promptText(fieldName);
   }
