@@ -3434,6 +3434,8 @@ class Plugin extends AppPlugin {
     this._running = true;
     this._qnPromptSessionRefCache = new Map();
     try {
+      // Path B is deferred off journal startup; pull synced config before using it.
+      await this._qnEnsurePathBReady();
       const allCollections = await this._getAllCollectionsCached();
       const eligible       = this._getEnabledCollections(allCollections);
 
